@@ -165,12 +165,22 @@ def collect_targets(
             raise SystemExit(f"Failed to load masscan JSON: {exc}") from exc
         if isinstance(data, dict):
             data = [data]
-        for entry in data:
+        key = f"{Path(args.masscan_json)}#masscan"
+        total = len(data)
+        start = new_state.get(key, 0) if resume else 0
+        if start >= total:
+            start = 0
+        end = start + chunk if chunk else total
+        slice_data = data[start:end]
+        for entry in slice_data:
             ip = entry.get("ip")
             for port_info in entry.get("ports", []):
                 if port_info.get("status") != "open":
                     continue
                 add_target(ip, [int(port_info.get("port", args.port))])
+        if total > 0 and resume:
+            new_offset = end if end < total else 0
+            new_state[key] = new_offset
 
     # Random public IPv4 generation
     for _ in range(args.random or 0):
