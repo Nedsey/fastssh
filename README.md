@@ -30,19 +30,33 @@ python fastssh.py --masscan-json masscan.json --users root --passwords root --st
 ```
 
 ## CLI options (high level)
-- `--target` / `--targets`: inline host[:ports] entries or file, ports can be comma-separated per host.
-- Large files: `--targets-chunk N` to take only N entries from a targets file (or masscan JSON); resume is automatic by default using `targets-state.json` (or set with `--targets-state`). Disable resume with `--no-resume`.
-- `--masscan-json`: read targets from masscan JSON output.
-- `--random N`: add N random public IPv4s using the default port (22 unless overridden with `--port`).
-- `--users` / `--user-file`, `--passwords` / `--pass-file`, `--combo-file`: supply creds; defaults to root/root if none given.
-- `--max-workers`: concurrent SSH attempts; `--queue-size`: bounded work queue (set 0 for unbounded).
-- Timeouts: `--connect-timeout`, `--auth-timeout`, `--read-timeout`.
-- Probing/ordering: `--no-probe` to skip TCP probe, `--banner` to capture SSH banners, `--allow-non-ssh` to keep non-SSH listeners, `--no-shuffle` to disable randomization.
-- Stop behavior: `--stop-first-host` (stop per host on first hit), `--stop-first-global` (stop everything on first hit).
-- Post-auth: `--command` to run on success, `--no-command-output` to suppress stdout/stderr logging.
-- Output/logging: `--results` JSONL path (defaults to timestamped file to avoid overwrite), `--log-interval` status cadence, `--hang-timeout` idle threshold before auto-stop (0 disables), `--verbose` to print per-attempt warnings/errors.
-- Enrichment (opt-in): `--gather-info` to collect system info/health on success, `--post-timeout` per-host info budget, `--age-cache` hostkey first-seen cache path, `--no-honeypot-detect` to disable honeypot heuristics.
-- Profiles: `--profile fast|balanced|info` applies tuned defaults unless you override specific flags.
+- Targets:
+  - `--target` / `--targets`: inline host[:ports] entries or file, ports can be comma-separated per host.
+  - `--masscan-json`: read targets from masscan JSON output.
+  - `--targets-chunk N`: take only N entries from a targets/masscan file; resume is automatic by default using `targets-state.json` (or set with `--targets-state`). Disable resume with `--no-resume`.
+  - `--random N`: add N random public IPv4s using the default port (22 unless overridden with `--port`).
+- Credentials:
+  - `--users` / `--user-file`, `--passwords` / `--pass-file`, `--combo-file`: supply creds; defaults to root/root if none given.
+- Concurrency/timeouts:
+  - `--max-workers`: concurrent SSH attempts; `--queue-size`: bounded work queue (set 0 for unbounded).
+  - Timeouts: `--connect-timeout`, `--auth-timeout`, `--read-timeout`.
+- Probing/ordering:
+  - `--no-probe` to skip TCP probe, `--banner` to capture SSH banners, `--allow-non-ssh` to keep non-SSH listeners, `--no-shuffle` to disable randomization.
+- Stop behavior:
+  - `--stop-first-host` (stop per host on first hit), `--stop-first-global` (stop everything on first hit).
+- Post-auth commands:
+  - `--command` to run on success, `--no-command-output` to suppress stdout/stderr logging.
+- Output/logging:
+  - `--results` JSONL path (defaults to timestamped file with collision avoidance).
+  - `--log-interval`, `--hang-timeout` (idle threshold before auto-stop), `--verbose` (per-attempt warnings/errors).
+  - Status: single-line live status with attempts/successes, queue, rate, idle time, and optional local CPU/net usage.
+  - `--no-cpu-net` to disable CPU/net sampling in status.
+- Enrichment (opt-in):
+  - `--gather-info` to collect system info/health on success.
+  - `--post-process` (default) runs enrichment after brute in a separate pool; `--no-post-process` runs inline.
+  - `--post-light` uses a smaller command set for speed; `--post-timeout` per-host info budget; `--age-cache` hostkey first-seen cache path; `--no-honeypot-detect` to disable honeypot heuristics; `--gather-concurrency` limits concurrent post tasks.
+- Profiles:
+  - `--profile fast|balanced|info` applies tuned defaults unless you override specific flags.
 
 ## Safety / Notes
 - This code avoids storing any provided passwords locally beyond the runtime
