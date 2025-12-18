@@ -15,6 +15,7 @@ import ipaddress
 import json
 import os
 import random
+import shutil
 import contextlib
 import time
 import sys
@@ -46,6 +47,7 @@ class Config:
     connect_timeout: float = 3.0
     auth_timeout: float = 5.0
     read_timeout: float = 3.0
+    attempt_timeout: float = 0.0  # hard ceiling per attempt; 0 means auto-calc
     max_workers: int = 200
     queue_size: int = 10000
     stop_first_host: bool = False
@@ -70,7 +72,6 @@ class Config:
     post_process: bool = True  # run enrichment in a post phase instead of inline
     post_light: bool = False  # collect lighter info set
     cpu_net: bool = True  # enable cpu/net sampling in status
-    require_ssh_banner: bool = True  # drop non-SSH listeners during probe unless disabled
 
 
 @dataclass
@@ -150,8 +151,11 @@ def collect_targets(
 
     # Inline targets
     for t in args.target or []:
-        host, ports = parse_target(t, args.port)
-        add_target(host, ports)
+        try:
+            host, ports = parse_target(t, args.port)
+            add_target(host, ports)
+        except ValueError:
+            print(f"[warn] skipping invalid target entry: {t}", flush=True)
 
     # File-based targets (with optional resume/chunk)
     if args.targets:
@@ -165,8 +169,11 @@ def collect_targets(
         announce_resume(str(path), start, total)
         slice_lines = lines[start:end]
         for line in slice_lines:
-            host, ports = parse_target(line, args.port)
-            add_target(host, ports)
+            try:
+                host, ports = parse_target(line, args.port)
+                add_target(host, ports)
+            except ValueError:
+                print(f"[warn] skipping invalid target line: {line}", flush=True)
         if total > 0 and resume:
             new_offset = end if end < total else 0
             planned_updates[str(path)] = new_offset
@@ -335,6 +342,8 @@ async def run_cmd(conn: asyncssh.SSHClientConnection, cmd: str, timeout: float) 
             "stderr": res.stderr,
             "exit_status": res.exit_status,
         }
+    except asyncio.CancelledError:
+        raise
     except Exception as exc:
         return {"ok": False, "stdout": "", "stderr": str(exc), "exit_status": -1}
 
@@ -470,6 +479,8 @@ async def gather_info(
         return await asyncio.wait_for(do(), timeout=cfg.post_timeout)
     except asyncio.TimeoutError:
         return {"error": "post_timeout"}
+    except asyncio.CancelledError:
+        raise
     except Exception as exc:
         return {"error": str(exc)}
 
@@ -577,6 +588,8 @@ async def attempt_login(
             connect_timeout=cfg.connect_timeout,
             compression_algs=["none"],
         )
+    except asyncio.CancelledError:
+        raise
     except (asyncssh.PermissionDenied, asyncssh.misc.DisconnectError, asyncio.TimeoutError) as exc:
         async with stats_lock:
             stats["failures"] += 1
@@ -604,6 +617,8 @@ async def attempt_login(
             sanity = await asyncio.wait_for(conn.run("echo fastssh_ok", check=False), timeout=cfg.read_timeout)
             if sanity.exit_status != 0:
                 raise RuntimeError(f"sanity command exit {sanity.exit_status}")
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             async with stats_lock:
                 stats["failures"] += 1
@@ -626,6 +641,8 @@ async def attempt_login(
                     record["command"] = cfg.command
                     record["stdout"] = result.stdout
                     record["stderr"] = result.stderr
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:
                 record["command"] = cfg.command
                 record["stdout"] = ""
@@ -689,19 +706,48 @@ async def worker(
         async with stats_lock:
             stats["active"] += 1
         try:
-            await attempt_login(
-                item,
-                cfg,
-                host_states[item.host],
-                global_stop,
-                file_lock,
-                stats,
-                stats_lock,
-                state,
-                state_lock,
-                gather_sem,
-                post_queue,
-            )
+            if cfg.attempt_timeout and cfg.attempt_timeout > 0:
+                await asyncio.wait_for(
+                    attempt_login(
+                        item,
+                        cfg,
+                        host_states[item.host],
+                        global_stop,
+                        file_lock,
+                        stats,
+                        stats_lock,
+                        state,
+                        state_lock,
+                        gather_sem,
+                        post_queue,
+                    ),
+                    timeout=cfg.attempt_timeout,
+                )
+            else:
+                await attempt_login(
+                    item,
+                    cfg,
+                    host_states[item.host],
+                    global_stop,
+                    file_lock,
+                    stats,
+                    stats_lock,
+                    state,
+                    state_lock,
+                    gather_sem,
+                    post_queue,
+                )
+        except asyncio.TimeoutError:
+            async with stats_lock:
+                stats["timeouts"] += 1
+                stats["last_progress"] = time.monotonic()
+            if cfg.verbose:
+                print(
+                    f"[warn] attempt watchdog timeout {item.host}:{item.port} after {cfg.attempt_timeout:.1f}s",
+                    flush=True,
+                )
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             async with stats_lock:
                 stats["errors"] += 1
@@ -864,12 +910,33 @@ async def progress_reporter(
         except Exception:
             return None
 
+    def fmt_eta(seconds: Optional[float]) -> str:
+        if seconds is None or seconds <= 0 or seconds == float("inf"):
+            return "n/a"
+        mins, secs = divmod(int(seconds), 60)
+        hours, mins = divmod(mins, 60)
+        if hours:
+            return f"{hours}h{mins:02d}m"
+        return f"{mins:02d}m{secs:02d}s"
+
+    def render_bar(done: int, total: int) -> str:
+        term_cols = shutil.get_terminal_size(fallback=(120, 20)).columns
+        width = max(10, min(30, term_cols // 4))
+        pct = (done / total) if total > 0 else 1.0
+        pct = max(0.0, min(1.0, pct))
+        filled = int(pct * width)
+        empty = width - filled
+        return f"[{'#' * filled}{'.' * empty}] {pct * 100:5.1f}%"
+
     prev_cpu = read_cpu()
     prev_net = read_net()
     prev_sample_t = time.monotonic()
     cpu_percent: Optional[float] = None
     net_rates: Tuple[Optional[float], Optional[float]] = (None, None)
     last_len = 0
+    first_render = True
+    interval = cfg.status_interval if cfg.status_interval else cfg.log_interval
+    interval = interval if interval and interval > 0 else 1.0
 
     async def snapshot(now: float) -> str:
         nonlocal prev_cpu, prev_net, prev_sample_t, cpu_percent, net_rates
@@ -897,47 +964,52 @@ async def progress_reporter(
             failures = int(stats.get("failures", 0))
             errors = int(stats.get("errors", 0))
             skipped = int(stats.get("skipped", 0))
+            timeouts = int(stats.get("timeouts", 0))
             active = int(stats.get("active", 0))
             total = int(stats.get("total", 0))
             last_progress = stats.get("last_progress", start_time)
         elapsed = now - start_time
         idle = now - last_progress if last_progress else 0.0
-        done = attempts + skipped
+        done = min(attempts + skipped, total)
         pending = max(total - done, 0)
         rate = attempts / elapsed if elapsed > 0 else 0.0
         success_rate = successes / attempts if attempts else 0.0
         qsize = queue.qsize()
+        eta_val = pending / rate if rate > 0 else None
+        eta_str = fmt_eta(eta_val)
         cpu_str = f"{cpu_percent:.1f}%" if (cfg.cpu_net and cpu_percent is not None) else "n/a"
-        rx_str = f"{net_rates[0]:.1f}" if (cfg.cpu_net and net_rates[0] is not None) else "n/a"
-        tx_str = f"{net_rates[1]:.1f}" if (cfg.cpu_net and net_rates[1] is not None) else "n/a"
+        rx_val, tx_val = net_rates
+        if cfg.cpu_net and rx_val is not None and tx_val is not None:
+            net_str = f"{rx_val / 1000:.2f}/{tx_val / 1000:.2f} Mb/s"
+        else:
+            net_str = "n/a"
         post_pending = post_queue.qsize() if cfg.gather_info and cfg.post_process else 0
-        parts = [
-            f"\r[status] elapsed {elapsed:.1f}s",
-            f"rate {rate:.2f}/s",
-            f"idle {idle:.1f}s",
-            f"queue {qsize}",
-            f"pending~{pending}",
-            f"active {active}/{cfg.max_workers}",
-            f"attempts {attempts}/{total}",
-            f"succ {successes}",
-            f"fail {failures}",
-            f"skip {skipped}",
-            f"err {errors}",
-            f"success-rate {success_rate:.2%}",
-            f"cpu {cpu_str}",
-            f"net {rx_str}/{tx_str} kbps",
-        ]
+        bar = render_bar(done, total)
+        status = (
+            f"[status] {bar} {done}/{total}"
+            f" | rate {rate:.2f}/s"
+            f" | eta {eta_str}"
+            f" | active {active}/{cfg.max_workers} q {qsize} pend {pending}"
+            f" | succ {successes} fail {failures} skip {skipped} timeouts {timeouts} err {errors}"
+            f" | sr {success_rate:.2%}"
+            f" | cpu {cpu_str}"
+            f" | net {net_str}"
+            f" | idle {idle:.1f}s"
+        )
         if post_pending:
-            parts.append(f"post {post_pending}")
-        return " | ".join(parts)
+            status += f" | post {post_pending}"
+        return status
 
     status = await snapshot(time.monotonic())
+    if first_render:
+        sys.stdout.write("\n")
+        first_render = False
     sys.stdout.write("\r" + status)
     sys.stdout.flush()
     last_len = len(status)
 
     while not stop.is_set():
-        await asyncio.sleep(min(cfg.status_interval, cfg.log_interval))
+        await asyncio.sleep(interval)
         now = time.monotonic()
         status = await snapshot(now)
         pad = " " * max(0, last_len - len(status))
@@ -979,6 +1051,7 @@ async def run(cfg: Config) -> None:
         "failures": 0,
         "skipped": 0,
         "errors": 0,
+        "timeouts": 0,
         "active": 0,
         "total": count_work_items(cfg),
         "last_progress": time.monotonic(),
@@ -1061,7 +1134,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--connect-timeout", type=float, default=3.0)
     p.add_argument("--auth-timeout", type=float, default=5.0)
     p.add_argument("--read-timeout", type=float, default=3.0)
+    p.add_argument("--attempt-timeout", type=float, default=0.0, help="hard cap (seconds) for a single SSH attempt; 0 = auto (connect+auth+read+1s)")
     p.add_argument("--log-interval", type=float, default=5.0, help="seconds between progress prints")
+    p.add_argument("--status-interval", type=float, help="seconds between status refreshes (defaults to log interval)")
     p.add_argument("--hang-timeout", type=float, default=60.0, help="seconds with no progress before hang stop (0 to disable)")
 
     p.add_argument("--command", help="run this command on success")
@@ -1089,6 +1164,14 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[Sequence[str]] = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    # Auto-detect masscan JSON if given via --targets with a .json file
+    if args.targets and not args.masscan_json:
+        p = Path(args.targets)
+        if p.suffix.lower() == ".json":
+            args.masscan_json = args.targets
+            args.targets = None
+            print(f"[info] Detected JSON targets, treating {p} as --masscan-json", flush=True)
 
     def apply_profile() -> None:
         if not args.profile:
@@ -1158,6 +1241,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         target_state_path = Path("targets-state.json")
     target_state = load_target_state(target_state_path)
 
+    attempt_timeout = args.attempt_timeout
+    if attempt_timeout is None or attempt_timeout <= 0:
+        attempt_timeout = args.connect_timeout + args.auth_timeout + args.read_timeout + 1.0
+
     targets, new_target_state, target_updates = collect_targets(
         args,
         target_state=target_state,
@@ -1174,6 +1261,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         connect_timeout=args.connect_timeout,
         auth_timeout=args.auth_timeout,
         read_timeout=args.read_timeout,
+        attempt_timeout=attempt_timeout,
         max_workers=args.max_workers,
         queue_size=args.queue_size,
         stop_first_host=args.stop_first_host,
@@ -1186,7 +1274,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         results_path=results_path,
         log_interval=args.log_interval,
         hang_timeout=args.hang_timeout,
-        status_interval=args.log_interval if args.log_interval else 1.0,
+        status_interval=args.status_interval if args.status_interval is not None else args.log_interval,
         verbose=args.verbose,
         require_ssh_banner=not args.allow_non_ssh,
         gather_info=args.gather_info,
