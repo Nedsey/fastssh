@@ -29,6 +29,27 @@ except ImportError:
     orjson = None
 
 import asyncssh
+try:
+    from rich.console import Console, Group
+    from rich.live import Live
+    from rich.panel import Panel
+    from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
+    from rich.table import Table
+
+    RICH_AVAILABLE = True
+except Exception:
+    Console = None
+    Group = None
+    Live = None
+    Panel = None
+    Progress = None
+    SpinnerColumn = None
+    BarColumn = None
+    TextColumn = None
+    TimeElapsedColumn = None
+    TimeRemainingColumn = None
+    Table = None
+    RICH_AVAILABLE = False
 
 
 # -----------------------------------------------------------------------------
@@ -72,6 +93,7 @@ class Config:
     post_process: bool = True  # run enrichment in a post phase instead of inline
     post_light: bool = False  # collect lighter info set
     cpu_net: bool = True  # enable cpu/net sampling in status
+    pretty_status: bool = True  # rich-based live status when available
 
 
 @dataclass
@@ -872,6 +894,8 @@ async def progress_reporter(
     post_queue: "asyncio.Queue[dict]",
 ) -> None:
     start_time = time.monotonic()
+    clear_line = "\r\x1b[K"
+    use_rich = RICH_AVAILABLE and cfg.pretty_status
 
     def read_cpu() -> Optional[Tuple[int, int]]:
         if not cfg.cpu_net:
@@ -933,12 +957,10 @@ async def progress_reporter(
     prev_sample_t = time.monotonic()
     cpu_percent: Optional[float] = None
     net_rates: Tuple[Optional[float], Optional[float]] = (None, None)
-    last_len = 0
-    first_render = True
     interval = cfg.status_interval if cfg.status_interval else cfg.log_interval
     interval = interval if interval and interval > 0 else 1.0
 
-    async def snapshot(now: float) -> str:
+    async def snapshot(now: float) -> Dict[str, Any]:
         nonlocal prev_cpu, prev_net, prev_sample_t, cpu_percent, net_rates
 
         if now - prev_sample_t >= cfg.cpu_net_interval:
@@ -984,50 +1006,129 @@ async def progress_reporter(
         else:
             net_str = "n/a"
         post_pending = post_queue.qsize() if cfg.gather_info and cfg.post_process else 0
-        bar = render_bar(done, total)
+        return {
+            "elapsed": elapsed,
+            "idle": idle,
+            "done": done,
+            "pending": pending,
+            "rate": rate,
+            "success_rate": success_rate,
+            "qsize": qsize,
+            "cpu_str": cpu_str,
+            "net_str": net_str,
+            "post_pending": post_pending,
+            "successes": successes,
+            "failures": failures,
+            "skipped": skipped,
+            "timeouts": timeouts,
+            "errors": errors,
+            "active": active,
+            "total": total,
+            "eta": eta_str,
+        }
+
+    def render_plain(metrics: Dict[str, Any]) -> str:
+        bar = render_bar(metrics["done"], metrics["total"])
         status = (
-            f"[status] {bar} {done}/{total}"
-            f" | rate {rate:.2f}/s"
-            f" | eta {eta_str}"
-            f" | active {active}/{cfg.max_workers} q {qsize} pend {pending}"
-            f" | succ {successes} fail {failures} skip {skipped} timeouts {timeouts} err {errors}"
-            f" | sr {success_rate:.2%}"
-            f" | cpu {cpu_str}"
-            f" | net {net_str}"
-            f" | idle {idle:.1f}s"
+            f"[status] {bar} {metrics['done']}/{metrics['total']}"
+            f" | rate {metrics['rate']:.2f}/s"
+            f" | eta {metrics['eta']}"
+            f" | active {metrics['active']}/{cfg.max_workers} q {metrics['qsize']} pend {metrics['pending']}"
+            f" | succ {metrics['successes']} fail {metrics['failures']} skip {metrics['skipped']} timeouts {metrics['timeouts']} err {metrics['errors']}"
+            f" | sr {metrics['success_rate']:.2%}"
+            f" | cpu {metrics['cpu_str']}"
+            f" | net {metrics['net_str']}"
+            f" | idle {metrics['idle']:.1f}s"
         )
-        if post_pending:
-            status += f" | post {post_pending}"
+        if metrics["post_pending"]:
+            status += f" | post {metrics['post_pending']}"
+        cols = shutil.get_terminal_size(fallback=(120, 20)).columns
+        if cols > 0 and len(status) >= cols:
+            max_len = max(10, cols - 1)
+            status = status[: max_len - 3] + "..."
         return status
 
-    status = await snapshot(time.monotonic())
-    if first_render:
+    def render_rich(metrics: Dict[str, Any], progress: Progress, task_id: int) -> "Panel":
+        total = metrics["total"] or metrics["done"]
+        progress.update(task_id, completed=metrics["done"], total=total)
+        grid = Table.grid(expand=True)
+        grid.add_row(
+            f"[cyan]Rate[/] {metrics['rate']:.2f}/s | ETA {metrics['eta']} | Idle {metrics['idle']:.1f}s",
+            f"[magenta]Active[/] {metrics['active']}/{cfg.max_workers} q {metrics['qsize']} pend {metrics['pending']}",
+        )
+        grid.add_row(
+            f"[green]Succ[/] {metrics['successes']} [red]Fail[/] {metrics['failures']} [yellow]Skip[/] {metrics['skipped']}",
+            f"[bright_black]Timeouts[/] {metrics['timeouts']} [red]Err[/] {metrics['errors']} [blue]SR[/] {metrics['success_rate']:.2%}",
+        )
+        grid.add_row(
+            f"[blue]CPU[/] {metrics['cpu_str']} | Net {metrics['net_str']}",
+            f"[cyan]Post[/] {metrics['post_pending']}" if metrics["post_pending"] else "",
+        )
+        return Panel(Group(progress, grid), title="[bold]fastssh status[/]", border_style="cyan")
+
+    metrics = await snapshot(time.monotonic())
+
+    if use_rich:
+        console = Console()
+        total = metrics["total"]
+        progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(bar_width=None),
+            TextColumn("[progress.percentage]{task.percentage:>5.1f}%"),
+            TextColumn("{task.completed}/{task.total}"),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            expand=True,
+            console=console,
+        )
+        task_id = progress.add_task("scan", total=total or None, completed=metrics["done"])
+        progress.start()
+
+        def render_panel(m: Dict[str, Any]) -> "Panel":
+            return render_rich(m, progress, task_id)
+
+        refresh_hz = max(1, int(1 / max(interval, 0.1)))
+        with Live(render_panel(metrics), console=console, refresh_per_second=refresh_hz, transient=False) as live:
+            while not stop.is_set():
+                await asyncio.sleep(interval)
+                now = time.monotonic()
+                metrics = await snapshot(now)
+                live.update(render_panel(metrics))
+
+                idle = metrics["idle"]
+                pending_now = metrics["pending"]
+                if cfg.hang_timeout > 0 and idle > cfg.hang_timeout and pending_now > 0:
+                    console.print(
+                        f"[yellow][hang][/yellow] No progress for {idle:.1f}s (threshold {cfg.hang_timeout}s). Draining queue and signaling stop."
+                    )
+                    stop.set()
+                    global_stop.set()
+                    drain_queue(queue)
+                    break
+        progress.stop()
+    else:
         sys.stdout.write("\n")
-        first_render = False
-    sys.stdout.write("\r" + status)
-    sys.stdout.flush()
-    last_len = len(status)
-
-    while not stop.is_set():
-        await asyncio.sleep(interval)
-        now = time.monotonic()
-        status = await snapshot(now)
-        pad = " " * max(0, last_len - len(status))
-        sys.stdout.write("\r" + status + pad)
+        sys.stdout.write(clear_line + render_plain(metrics))
         sys.stdout.flush()
-        last_len = len(status)
 
-        async with stats_lock:
-            idle = now - stats.get("last_progress", start_time)
-            pending_now = max(stats.get("total", 0) - (stats.get("attempts", 0) + stats.get("skipped", 0)), 0)
-        if cfg.hang_timeout > 0 and idle > cfg.hang_timeout and pending_now > 0:
-            sys.stdout.write(
-                f"\n[hang] No progress for {idle:.1f}s (threshold {cfg.hang_timeout}s). Draining queue and signaling stop.\n"
-            )
+        while not stop.is_set():
+            await asyncio.sleep(interval)
+            now = time.monotonic()
+            metrics = await snapshot(now)
+            sys.stdout.write(clear_line + render_plain(metrics))
             sys.stdout.flush()
-            stop.set()
-            global_stop.set()
-            drain_queue(queue)
+
+            idle = metrics["idle"]
+            pending_now = metrics["pending"]
+            if cfg.hang_timeout > 0 and idle > cfg.hang_timeout and pending_now > 0:
+                sys.stdout.write(
+                    f"\n[hang] No progress for {idle:.1f}s (threshold {cfg.hang_timeout}s). Draining queue and signaling stop.\n"
+                )
+                sys.stdout.flush()
+                stop.set()
+                global_stop.set()
+                drain_queue(queue)
     sys.stdout.write("\n")
     sys.stdout.flush()
 
@@ -1138,6 +1239,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--log-interval", type=float, default=5.0, help="seconds between progress prints")
     p.add_argument("--status-interval", type=float, help="seconds between status refreshes (defaults to log interval)")
     p.add_argument("--hang-timeout", type=float, default=60.0, help="seconds with no progress before hang stop (0 to disable)")
+    p.add_argument("--no-pretty-status", action="store_true", help="disable rich-based status UI (fallback to plain text)")
 
     p.add_argument("--command", help="run this command on success")
     p.add_argument("--no-command-output", action="store_true", help="suppress command stdout/stderr in logs")
@@ -1285,6 +1387,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         post_light=args.post_light,
         post_process=not args.no_post_process,
         cpu_net=not args.no_cpu_net,
+        pretty_status=not args.no_pretty_status,
     )
 
     try:
