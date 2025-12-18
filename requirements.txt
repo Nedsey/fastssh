@@ -1,0 +1,2 @@
+asyncssh>=2.14.0
+orjson>=3.9.5
