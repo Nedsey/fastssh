@@ -334,7 +334,10 @@ async def worker(
 
 
 async def build_queue(
-    cfg: Config, queue: "asyncio.Queue[Optional[WorkItem]]", host_states: Dict[str, HostState]
+    cfg: Config,
+    queue: "asyncio.Queue[Optional[WorkItem]]",
+    host_states: Dict[str, HostState],
+    global_stop: asyncio.Event,
 ) -> None:
     hosts = list(cfg.targets.items())
     combos = list(cfg.combos)
@@ -342,22 +345,26 @@ async def build_queue(
         random.shuffle(hosts)
         random.shuffle(combos)
 
-    for host, ports in hosts:
-        host_states.setdefault(host, HostState())
-        port_list = list(ports)
-        if cfg.shuffle:
-            random.shuffle(port_list)
-        for port in port_list:
-            for user, pwd in combos:
-                await queue.put(WorkItem(host, port, user, pwd))
-
-    for _ in range(cfg.max_workers):
-        await queue.put(None)
+    try:
+        for host, ports in hosts:
+            host_states.setdefault(host, HostState())
+            port_list = list(ports)
+            if cfg.shuffle:
+                random.shuffle(port_list)
+            for port in port_list:
+                for user, pwd in combos:
+                    if global_stop.is_set():
+                        break
+                    await queue.put(WorkItem(host, port, user, pwd))
+    finally:
+        for _ in range(cfg.max_workers):
+            await queue.put(None)
 
 
 async def probe_targets(cfg: Config, host_states: Dict[str, HostState]) -> None:
     if not cfg.probe:
         return
+    print("[info] Probing targets...", flush=True)
     filtered: Dict[str, Set[int]] = {}
     tasks = []
     for host, ports in cfg.targets.items():
@@ -383,6 +390,23 @@ async def probe_targets(cfg: Config, host_states: Dict[str, HostState]) -> None:
     cfg.targets = filtered
     if not cfg.targets:
         raise SystemExit("No live SSH targets after probing.")
+    print(f"[info] Probe complete. Live hosts: {len(cfg.targets)}", flush=True)
+
+
+def count_work_items(cfg: Config) -> int:
+    return sum(len(ports) * len(cfg.combos) for ports in cfg.targets.values())
+
+
+def drain_queue(queue: "asyncio.Queue[Optional[WorkItem]]") -> None:
+    # Best-effort empty to accelerate shutdown on hang/stop.
+    try:
+        while True:
+            item = queue.get_nowait()
+            queue.task_done()
+            if item is None:
+                queue.put_nowait(item)
+    except asyncio.QueueEmpty:
+        return
 
 
 async def progress_reporter(
@@ -394,9 +418,8 @@ async def progress_reporter(
     global_stop: asyncio.Event,
 ) -> None:
     start_time = time.monotonic()
-    while not stop.is_set():
-        await asyncio.sleep(cfg.log_interval)
-        now = time.monotonic()
+
+    async def snapshot(now: float) -> str:
         async with stats_lock:
             attempts = int(stats.get("attempts", 0))
             successes = int(stats.get("successes", 0))
@@ -420,23 +443,35 @@ async def progress_reporter(
             f"  attempts: {attempts}/{total} | successes: {successes} | failures: {failures} | skipped: {skipped} | errors: {errors}",
             f"  success-rate: {success_rate:.2%}",
         ]
-        print("\n".join(lines))
+        return "\n".join(lines)
 
-        if cfg.hang_timeout > 0 and idle > cfg.hang_timeout and pending > 0:
-            print(f"[hang] No progress for {idle:.1f}s (threshold {cfg.hang_timeout}s). Signaling stop.")
+    # Print immediately so users see status even before the first interval elapses.
+    print(await snapshot(time.monotonic()), flush=True)
+
+    while not stop.is_set():
+        await asyncio.sleep(cfg.log_interval)
+        now = time.monotonic()
+        print(await snapshot(now), flush=True)
+
+        async with stats_lock:
+            idle = now - stats.get("last_progress", start_time)
+            pending_now = max(stats.get("total", 0) - (stats.get("attempts", 0) + stats.get("skipped", 0)), 0)
+        if cfg.hang_timeout > 0 and idle > cfg.hang_timeout and pending_now > 0:
+            print(
+                f"[hang] No progress for {idle:.1f}s (threshold {cfg.hang_timeout}s). Draining queue and signaling stop.",
+                flush=True,
+            )
             stop.set()
             global_stop.set()
-
-
-def count_work_items(cfg: Config) -> int:
-    return sum(len(ports) * len(cfg.combos) for ports in cfg.targets.values())
+            drain_queue(queue)
 
 
 async def run(cfg: Config) -> None:
     host_states: Dict[str, HostState] = {}
     await probe_targets(cfg, host_states)
 
-    queue: "asyncio.Queue[Optional[WorkItem]]" = asyncio.Queue(maxsize=cfg.queue_size)
+    queue_size = max(0, cfg.queue_size)
+    queue: "asyncio.Queue[Optional[WorkItem]]" = asyncio.Queue(maxsize=queue_size)
     global_stop = asyncio.Event()
     file_lock = asyncio.Lock()
     stats_lock = asyncio.Lock()
@@ -458,7 +493,9 @@ async def run(cfg: Config) -> None:
     reporter_stop = asyncio.Event()
     reporter = asyncio.create_task(progress_reporter(cfg, stats, stats_lock, queue, reporter_stop, global_stop))
 
-    await build_queue(cfg, queue, host_states)
+    print("[info] Building work queue...", flush=True)
+    await build_queue(cfg, queue, host_states, global_stop)
+    print("[info] Work queue built, processing...", flush=True)
     await queue.join()
     global_stop.set()
     reporter_stop.set()
