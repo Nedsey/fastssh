@@ -312,12 +312,18 @@ async def gather_info(
         }
 
         cmd_results: Dict[str, Any] = {}
+        lost = False
         for key, cmd in sysinfo_cmds.items():
-            cmd_results[key] = await run_cmd(conn, cmd, timeout=cfg.read_timeout)
+            res = await run_cmd(conn, cmd, timeout=cfg.read_timeout)
+            cmd_results[key] = res
+            stderr_lower = res.get("stderr", "").lower()
+            if any(term in stderr_lower for term in ["connection lost", "connection closed", "channel closed", "connection reset"]):
+                lost = True
+                break
         info["commands"] = cmd_results
 
         try:
-            lines = [l.strip() for l in cmd_results["id"]["stdout"].splitlines() if l.strip()]
+            lines = [l.strip() for l in cmd_results.get("id", {}).get("stdout", "").splitlines() if l.strip()]
             uid = int(lines[0]) if lines else None
             user = lines[1] if len(lines) > 1 else None
             root_writable = any("root_writable" in l for l in lines)
@@ -327,12 +333,12 @@ async def gather_info(
 
         # Basic parsing
         try:
-            load_parts = cmd_results["load"]["stdout"].split()
+            load_parts = cmd_results.get("load", {}).get("stdout", "").split()
             load_1 = float(load_parts[0]) if load_parts else 0.0
         except Exception:
             load_1 = 0.0
         try:
-            meminfo = cmd_results["mem"]["stdout"]
+            meminfo = cmd_results.get("mem", {}).get("stdout", "")
             mem_total = mem_free = 0
             for line in meminfo.splitlines():
                 if line.startswith("MemTotal:"):
@@ -345,7 +351,7 @@ async def gather_info(
 
         disk_total = disk_free = 0
         try:
-            lines = cmd_results["disk"]["stdout"].splitlines()
+            lines = cmd_results.get("disk", {}).get("stdout", "").splitlines()
             if len(lines) >= 2:
                 parts = lines[1].split()
                 if len(parts) >= 4:
@@ -355,7 +361,7 @@ async def gather_info(
             pass
 
         try:
-            cores = int(cmd_results["nproc"]["stdout"].strip().splitlines()[0])
+            cores = int(cmd_results.get("nproc", {}).get("stdout", "").strip().splitlines()[0])
         except Exception:
             cores = 1
         info["health"] = summarize_health(load_1, cores, mem_free, mem_total, disk_free, disk_total)
@@ -365,19 +371,22 @@ async def gather_info(
             banner = host_state.banner or ssh_info.get("banner", "")
             if banner and any(x in banner.lower() for x in ["cowrie", "kippo", "dionaea"]):
                 hp_reasons.append("honeypot-like banner")
-            uptime_out = cmd_results["uptime"]["stdout"]
+            uptime_out = cmd_results.get("uptime", {}).get("stdout", "")
             try:
                 uptime_secs = float(uptime_out.split()[0])
                 if uptime_secs < 300 and banner and "openssh" in banner.lower():
                     hp_reasons.append("very low uptime with normal banner")
             except Exception:
                 pass
-            if cmd_results["id"]["exit_status"] != 0:
+            id_exit = cmd_results.get("id", {}).get("exit_status")
+            if not lost and id_exit not in (0, None):
                 hp_reasons.append("basic command failures")
-            if hp_reasons:
-                info["honeypot"] = {"suspect": True, "reasons": hp_reasons}
-            else:
-                info["honeypot"] = {"suspect": False, "reasons": []}
+            if lost:
+                hp_reasons.append("connection lost during info collection")
+            info["honeypot"] = {"suspect": bool(hp_reasons), "reasons": hp_reasons}
+
+        if lost:
+            info["post_error"] = "connection_lost"
 
         return info
 
@@ -442,6 +451,19 @@ async def attempt_login(
         return
 
     async with conn:
+        # Sanity check that we can actually run a trivial command; if not, treat as failure.
+        try:
+            sanity = await asyncio.wait_for(conn.run("echo fastssh_ok", check=False), timeout=cfg.read_timeout)
+            if sanity.exit_status != 0:
+                raise RuntimeError(f"sanity command exit {sanity.exit_status}")
+        except Exception as exc:
+            async with stats_lock:
+                stats["failures"] += 1
+                stats["last_progress"] = time.monotonic()
+            if cfg.verbose:
+                print(f"[warn] session unusable after auth {item.host}:{item.port}: {exc}", flush=True)
+            return
+
         record = {
             "host": item.host,
             "port": item.port,
@@ -766,6 +788,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-honeypot-detect", action="store_true", help="disable honeypot heuristics")
     p.add_argument("--post-timeout", type=float, default=5.0, help="timeout budget for post-auth info collection")
     p.add_argument("--age-cache", help="path to hostkey first-seen cache (json)")
+    # Note: a short sanity command runs after auth to ensure the session can execute commands; failures are treated as auth failures.
     return p
 
 
