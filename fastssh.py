@@ -53,6 +53,7 @@ class Config:
     results_path: Path = Path("results.jsonl")
     log_interval: float = 5.0
     hang_timeout: float = 60.0  # seconds with no progress before declaring hang (0 disables)
+    verbose: bool = False
 
 
 @dataclass
@@ -236,19 +237,21 @@ async def attempt_login(
         async with stats_lock:
             stats["failures"] += 1
             stats["last_progress"] = time.monotonic()
-        print(f"[warn] auth failed {item.host}:{item.port} {item.user}:{item.password} ({exc})")
+        if cfg.verbose:
+            print(f"[warn] auth failed {item.host}:{item.port} {item.user}:{item.password} ({exc})", flush=True)
         return
     except OSError as exc:
         async with stats_lock:
             stats["failures"] += 1
             stats["last_progress"] = time.monotonic()
-        print(f"[warn] connection error {item.host}:{item.port} ({exc})")
+        if cfg.verbose:
+            print(f"[warn] connection error {item.host}:{item.port} ({exc})", flush=True)
         return
     except Exception as exc:
         async with stats_lock:
             stats["errors"] += 1
             stats["last_progress"] = time.monotonic()
-        print(f"[error] unexpected error before auth {item.host}:{item.port}: {exc}")
+        print(f"[error] unexpected error before auth {item.host}:{item.port}: {exc}", flush=True)
         return
 
     async with conn:
@@ -319,7 +322,7 @@ async def worker(
             async with stats_lock:
                 stats["errors"] += 1
                 stats["last_progress"] = time.monotonic()
-            print(f"[error] worker crash avoided for {item.host}:{item.port}: {exc}")
+            print(f"[error] worker crash avoided for {item.host}:{item.port}: {exc}", flush=True)
         finally:
             async with stats_lock:
                 stats["active"] = max(0, stats["active"] - 1)
@@ -541,6 +544,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--banner", action="store_true", help="capture SSH banner during probe")
     p.add_argument("--no-shuffle", action="store_true", help="disable randomization of attempts")
     p.add_argument("--results", default="results.jsonl", help="path to JSONL output")
+    p.add_argument("--verbose", action="store_true", help="print per-attempt warnings/errors")
     return p
 
 
@@ -566,6 +570,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         results_path=Path(args.results),
         log_interval=args.log_interval,
         hang_timeout=args.hang_timeout,
+        verbose=args.verbose,
     )
 
     try:
