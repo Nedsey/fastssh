@@ -31,6 +31,7 @@ python fastssh.py --masscan-json masscan.json --users root --passwords root --st
 
 ## CLI options (high level)
 - `--target` / `--targets`: inline host[:ports] entries or file, ports can be comma-separated per host.
+- Large files: `--targets-chunk N` to take only N entries from a targets file, `--targets-resume` to continue where you left off, `--targets-state` to control the resume state file (defaults to `targets-state.json` when resume is on).
 - `--masscan-json`: read targets from masscan JSON output.
 - `--random N`: add N random public IPv4s using the default port (22 unless overridden with `--port`).
 - `--users` / `--user-file`, `--passwords` / `--pass-file`, `--combo-file`: supply creds; defaults to root/root if none given.

@@ -38,6 +38,8 @@ import asyncssh
 class Config:
     targets: Dict[str, Set[int]] = field(default_factory=dict)
     combos: List[Tuple[str, str]] = field(default_factory=list)
+    target_state: Dict[str, int] = field(default_factory=dict)
+    target_state_path: Optional[Path] = None
     connect_timeout: float = 3.0
     auth_timeout: float = 5.0
     read_timeout: float = 3.0
@@ -96,8 +98,36 @@ def parse_target(line: str, default_port: int = 22) -> Tuple[str, List[int]]:
     return host, [default_port]
 
 
-def collect_targets(args: argparse.Namespace) -> Dict[str, Set[int]]:
+def load_target_state(path: Optional[Path]) -> Dict[str, int]:
+    if not path:
+        return {}
+    try:
+        data = json.loads(path.read_text())
+        if isinstance(data, dict):
+            return {str(k): int(v) for k, v in data.items()}
+    except Exception:
+        pass
+    return {}
+
+
+def save_target_state(path: Optional[Path], state: Dict[str, int]) -> None:
+    if not path:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(state))
+    except Exception as exc:
+        print(f"[warn] failed to write target state {path}: {exc}", flush=True)
+
+
+def collect_targets(
+    args: argparse.Namespace,
+    target_state: Dict[str, int],
+    resume: bool,
+    chunk: Optional[int],
+) -> Tuple[Dict[str, Set[int]], Dict[str, int]]:
     targets: Dict[str, Set[int]] = {}
+    new_state = dict(target_state)
 
     def add_target(host: str, ports: Iterable[int]) -> None:
         if not host:
@@ -109,11 +139,22 @@ def collect_targets(args: argparse.Namespace) -> Dict[str, Set[int]]:
         host, ports = parse_target(t, args.port)
         add_target(host, ports)
 
-    # File-based targets
+    # File-based targets (with optional resume/chunk)
     if args.targets:
-        for line in load_lines(Path(args.targets)):
+        path = Path(args.targets)
+        lines = load_lines(path)
+        total = len(lines)
+        start = new_state.get(str(path), 0) if resume else 0
+        if start >= total:
+            start = 0
+        end = start + chunk if chunk else total
+        slice_lines = lines[start:end]
+        for line in slice_lines:
             host, ports = parse_target(line, args.port)
             add_target(host, ports)
+        if total > 0 and resume:
+            new_offset = end if end < total else 0
+            new_state[str(path)] = new_offset
 
     # masscan JSON ingestion
     if args.masscan_json:
@@ -140,7 +181,7 @@ def collect_targets(args: argparse.Namespace) -> Dict[str, Set[int]]:
     if not targets:
         raise SystemExit("No targets provided.")
 
-    return targets
+    return targets, new_state
 
 
 def load_creds(args: argparse.Namespace) -> List[Tuple[str, str]]:
@@ -674,33 +715,34 @@ async def progress_reporter(
         rate = attempts / elapsed if elapsed > 0 else 0.0
         success_rate = successes / attempts if attempts else 0.0
         qsize = queue.qsize()
-        return (
-            f"\r[status] elapsed {elapsed:.1f}s | rate {rate:.2f}/s | idle {idle:.1f}s | "
-            f"queue {qsize} pending~{pending} active {active}/{cfg.max_workers} | "
-            f"attempts {attempts}/{total} succ {successes} fail {failures} skip {skipped} err {errors} | "
-            f"success-rate {success_rate:.2%}"
-        )
+        lines = [
+            "[status]",
+            f"  elapsed: {elapsed:.1f}s | rate: {rate:.2f}/s | idle: {idle:.1f}s",
+            f"  queue: {qsize} | pending-est: {pending} | active: {active}/{cfg.max_workers}",
+            f"  attempts: {attempts}/{total} | successes: {successes} | failures: {failures} | skipped: {skipped} | errors: {errors}",
+            f"  success-rate: {success_rate:.2%}",
+        ]
+        return "\n".join(lines)
 
     # Print immediately so users see status even before the first interval elapses.
-    print(await snapshot(time.monotonic()), end="", flush=True)
+    print(await snapshot(time.monotonic()), flush=True)
 
     while not stop.is_set():
         await asyncio.sleep(cfg.log_interval)
         now = time.monotonic()
-        print(await snapshot(now), end="", flush=True)
+        print(await snapshot(now), flush=True)
 
         async with stats_lock:
             idle = now - stats.get("last_progress", start_time)
             pending_now = max(stats.get("total", 0) - (stats.get("attempts", 0) + stats.get("skipped", 0)), 0)
         if cfg.hang_timeout > 0 and idle > cfg.hang_timeout and pending_now > 0:
             print(
-                f"\n[hang] No progress for {idle:.1f}s (threshold {cfg.hang_timeout}s). Draining queue and signaling stop.",
+                f"[hang] No progress for {idle:.1f}s (threshold {cfg.hang_timeout}s). Draining queue and signaling stop.",
                 flush=True,
             )
             stop.set()
             global_stop.set()
             drain_queue(queue)
-    print()  # newline after final status
 
 
 async def run(cfg: Config) -> None:
@@ -745,6 +787,8 @@ async def run(cfg: Config) -> None:
         await asyncio.gather(*workers)
     with contextlib.suppress(Exception):
         save_age_cache(cfg.age_cache, state.get("age_cache", {}))
+    with contextlib.suppress(Exception):
+        save_target_state(cfg.target_state_path, cfg.target_state)
 
 
 # -----------------------------------------------------------------------------
@@ -756,6 +800,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="fast SSH credential testing orchestrator")
     p.add_argument("--target", action="append", help="host or host:ports (comma-separated)")
     p.add_argument("--targets", help="file with host[:ports] per line")
+    p.add_argument("--targets-chunk", type=int, help="limit to N target lines from file (after resume offset)")
+    p.add_argument("--targets-resume", action="store_true", help="resume where you left off in --targets file")
+    p.add_argument("--targets-state", help="path to targets resume state (json)")
     p.add_argument("--masscan-json", help="masscan JSON output to ingest")
     p.add_argument("--random", type=int, default=0, help="generate N random public IPv4s")
     p.add_argument("--port", type=int, default=22, help="default port when none given")
@@ -801,9 +848,24 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         results_target = f"results-{int(time.time())}.jsonl"
     results_path = Path(results_target)
     age_cache_path = Path(args.age_cache) if args.age_cache else (Path("age-cache.json") if args.gather_info else None)
+    target_state_path = (
+        Path(args.targets_state)
+        if args.targets_state
+        else (Path("targets-state.json") if args.targets_resume and args.targets else None)
+    )
+    target_state = load_target_state(target_state_path)
+
+    targets, new_target_state = collect_targets(
+        args,
+        target_state=target_state,
+        resume=args.targets_resume,
+        chunk=args.targets_chunk,
+    )
 
     cfg = Config(
-        targets=collect_targets(args),
+        targets=targets,
+        target_state=new_target_state,
+        target_state_path=target_state_path,
         combos=load_creds(args),
         connect_timeout=args.connect_timeout,
         auth_timeout=args.auth_timeout,
