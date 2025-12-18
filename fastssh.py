@@ -40,6 +40,7 @@ class Config:
     combos: List[Tuple[str, str]] = field(default_factory=list)
     target_state: Dict[str, int] = field(default_factory=dict)
     target_state_path: Optional[Path] = None
+    resume_targets: bool = True
     connect_timeout: float = 3.0
     auth_timeout: float = 5.0
     read_timeout: float = 3.0
@@ -777,18 +778,22 @@ async def run(cfg: Config) -> None:
     print("[info] Building work queue...", flush=True)
     await build_queue(cfg, queue, host_states, global_stop)
     print("[info] Work queue built, processing...", flush=True)
-    await queue.join()
-    global_stop.set()
-    reporter_stop.set()
-    await reporter
-    for w in workers:
-        w.cancel()
-    with contextlib.suppress(Exception):
-        await asyncio.gather(*workers)
-    with contextlib.suppress(Exception):
-        save_age_cache(cfg.age_cache, state.get("age_cache", {}))
-    with contextlib.suppress(Exception):
-        save_target_state(cfg.target_state_path, cfg.target_state)
+    try:
+        await queue.join()
+    except KeyboardInterrupt:
+        print("\n[info] Interrupt received, shutting down gracefully...", flush=True)
+    finally:
+        global_stop.set()
+        reporter_stop.set()
+        await reporter
+        for w in workers:
+            w.cancel()
+        with contextlib.suppress(Exception):
+            await asyncio.gather(*workers)
+        with contextlib.suppress(Exception):
+            save_age_cache(cfg.age_cache, state.get("age_cache", {}))
+        with contextlib.suppress(Exception):
+            save_target_state(cfg.target_state_path, cfg.target_state)
 
 
 # -----------------------------------------------------------------------------
@@ -801,8 +806,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--target", action="append", help="host or host:ports (comma-separated)")
     p.add_argument("--targets", help="file with host[:ports] per line")
     p.add_argument("--targets-chunk", type=int, help="limit to N target lines from file (after resume offset)")
-    p.add_argument("--targets-resume", action="store_true", help="resume where you left off in --targets file")
     p.add_argument("--targets-state", help="path to targets resume state (json)")
+    p.add_argument("--no-resume", action="store_true", help="disable auto-resume for targets file")
+    p.add_argument("--profile", choices=["fast", "balanced", "info"], help="apply preset tuning (overrides defaults unless manually set)")
     p.add_argument("--masscan-json", help="masscan JSON output to ingest")
     p.add_argument("--random", type=int, default=0, help="generate N random public IPv4s")
     p.add_argument("--port", type=int, default=22, help="default port when none given")
@@ -843,6 +849,49 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    def apply_profile() -> None:
+        if not args.profile:
+            return
+        profiles = {
+            "fast": {
+                "max_workers": 400,
+                "queue_size": 0,
+                "connect_timeout": 1.5,
+                "auth_timeout": 3.0,
+                "read_timeout": 2.0,
+                "log_interval": 3.0,
+                "hang_timeout": 45.0,
+                "gather_info": False,
+            },
+            "balanced": {
+                "max_workers": 250,
+                "queue_size": 0,
+                "connect_timeout": 2.0,
+                "auth_timeout": 4.0,
+                "read_timeout": 3.0,
+                "log_interval": 4.0,
+                "hang_timeout": 60.0,
+            },
+            "info": {
+                "max_workers": 200,
+                "queue_size": 0,
+                "connect_timeout": 2.5,
+                "auth_timeout": 5.0,
+                "read_timeout": 4.0,
+                "log_interval": 5.0,
+                "hang_timeout": 90.0,
+                "gather_info": True,
+                "post_timeout": 6.0,
+            },
+        }
+        profile_vals = profiles.get(args.profile, {})
+        for key, val in profile_vals.items():
+            default_val = parser.get_default(key)
+            if getattr(args, key, None) == default_val:
+                setattr(args, key, val)
+
+    apply_profile()
+
     results_target = args.results
     if not results_target or results_target == "results.jsonl":
         results_target = f"results-{int(time.time())}.jsonl"
@@ -851,14 +900,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     target_state_path = (
         Path(args.targets_state)
         if args.targets_state
-        else (Path("targets-state.json") if args.targets_resume and args.targets else None)
+        else (Path("targets-state.json") if args.targets else None)
     )
     target_state = load_target_state(target_state_path)
 
     targets, new_target_state = collect_targets(
         args,
         target_state=target_state,
-        resume=args.targets_resume,
+        resume=not args.no_resume,
         chunk=args.targets_chunk,
     )
 
