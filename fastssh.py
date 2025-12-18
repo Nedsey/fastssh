@@ -54,6 +54,7 @@ class Config:
     log_interval: float = 5.0
     hang_timeout: float = 60.0  # seconds with no progress before declaring hang (0 disables)
     verbose: bool = False
+    require_ssh_banner: bool = True  # drop non-SSH listeners during probe unless disabled
 
 
 @dataclass
@@ -376,16 +377,36 @@ async def probe_targets(cfg: Config, host_states: Dict[str, HostState]) -> None:
 
     sem = asyncio.Semaphore(cfg.max_workers)
     results: Dict[Tuple[str, int], Optional[str]] = {}
+    probe_stats = {"done": 0, "live": 0, "ssh": 0, "total": len(tasks)}
+    status_lock = asyncio.Lock()
+
+    def render_status() -> str:
+        return (
+            f"\r[probe] {probe_stats['done']}/{probe_stats['total']} checked | "
+            f"live: {probe_stats['live']} | ssh: {probe_stats['ssh']}"
+        )
 
     async def one(host: str, port: int) -> None:
         async with sem:
             banner = await probe_port(host, port, cfg.connect_timeout)
             results[(host, port)] = banner
+            is_live = banner is not None
+            is_ssh = bool(banner) and banner.startswith("SSH-")
+            async with status_lock:
+                probe_stats["done"] += 1
+                if is_live:
+                    probe_stats["live"] += 1
+                if is_ssh:
+                    probe_stats["ssh"] += 1
+                print(render_status(), end="", flush=True)
 
     await asyncio.gather(*(one(h, p) for h, p in tasks))
+    print()  # newline after live status
 
     for (host, port), banner in results.items():
         if banner is not None:
+            if cfg.require_ssh_banner and (not banner or not banner.startswith("SSH-")):
+                continue
             filtered.setdefault(host, set()).add(port)
             if cfg.capture_banner:
                 host_states.setdefault(host, HostState()).banner = banner
@@ -545,6 +566,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-shuffle", action="store_true", help="disable randomization of attempts")
     p.add_argument("--results", default="results.jsonl", help="path to JSONL output")
     p.add_argument("--verbose", action="store_true", help="print per-attempt warnings/errors")
+    p.add_argument("--allow-non-ssh", action="store_true", help="include non-SSH listeners detected during probe")
     return p
 
 
@@ -571,6 +593,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         log_interval=args.log_interval,
         hang_timeout=args.hang_timeout,
         verbose=args.verbose,
+        require_ssh_banner=not args.allow_non_ssh,
     )
 
     try:

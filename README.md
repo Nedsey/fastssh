@@ -36,7 +36,7 @@ python fastssh.py --masscan-json masscan.json --users root --passwords root --st
 - `--users` / `--user-file`, `--passwords` / `--pass-file`, `--combo-file`: supply creds; defaults to root/root if none given.
 - `--max-workers`: concurrent SSH attempts; `--queue-size`: bounded work queue (set 0 for unbounded).
 - Timeouts: `--connect-timeout`, `--auth-timeout`, `--read-timeout`.
-- Probing/ordering: `--no-probe` to skip TCP probe, `--banner` to capture SSH banners, `--no-shuffle` to disable randomization.
+- Probing/ordering: `--no-probe` to skip TCP probe, `--banner` to capture SSH banners, `--allow-non-ssh` to keep non-SSH listeners, `--no-shuffle` to disable randomization.
 - Stop behavior: `--stop-first-host` (stop per host on first hit), `--stop-first-global` (stop everything on first hit).
 - Post-auth: `--command` to run on success, `--no-command-output` to suppress stdout/stderr logging.
 - Output/logging: `--results` JSONL path, `--log-interval` status cadence, `--hang-timeout` idle threshold before auto-stop (0 disables), `--verbose` to print per-attempt warnings/errors.
