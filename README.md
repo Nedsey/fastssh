@@ -39,7 +39,8 @@ python fastssh.py --masscan-json masscan.json --users root --passwords root --st
 - Probing/ordering: `--no-probe` to skip TCP probe, `--banner` to capture SSH banners, `--allow-non-ssh` to keep non-SSH listeners, `--no-shuffle` to disable randomization.
 - Stop behavior: `--stop-first-host` (stop per host on first hit), `--stop-first-global` (stop everything on first hit).
 - Post-auth: `--command` to run on success, `--no-command-output` to suppress stdout/stderr logging.
-- Output/logging: `--results` JSONL path, `--log-interval` status cadence, `--hang-timeout` idle threshold before auto-stop (0 disables), `--verbose` to print per-attempt warnings/errors.
+- Output/logging: `--results` JSONL path (defaults to timestamped file to avoid overwrite), `--log-interval` status cadence, `--hang-timeout` idle threshold before auto-stop (0 disables), `--verbose` to print per-attempt warnings/errors.
+- Enrichment (opt-in): `--gather-info` to collect system info/health on success, `--post-timeout` per-host info budget, `--age-cache` hostkey first-seen cache path, `--no-honeypot-detect` to disable honeypot heuristics.
 
 ## Safety / Notes
 - This code avoids storing any provided passwords locally beyond the runtime
