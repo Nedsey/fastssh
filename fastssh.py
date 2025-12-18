@@ -17,6 +17,7 @@ import os
 import random
 import contextlib
 import time
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
@@ -473,6 +474,76 @@ async def gather_info(
         return {"error": str(exc)}
 
 
+async def run_post_processing(
+    cfg: Config,
+    post_queue: "asyncio.Queue[dict]",
+    host_states: Dict[str, HostState],
+    file_lock: asyncio.Lock,
+    state: Dict[str, Any],
+    state_lock: asyncio.Lock,
+    gather_sem: asyncio.Semaphore,
+) -> None:
+    tasks = []
+
+    async def process(record: dict) -> None:
+        host = record.get("host")
+        port = record.get("port")
+        user = record.get("user")
+        pwd = record.get("password")
+        host_state = host_states.get(host, HostState())
+        try:
+            conn = await asyncssh.connect(
+                host,
+                port=port,
+                username=user,
+                password=pwd,
+                known_hosts=None,
+                client_keys=[],
+                login_timeout=cfg.auth_timeout,
+                connect_timeout=cfg.connect_timeout,
+                compression_algs=["none"],
+            )
+        except Exception as exc:
+            record["error"] = f"post_connect: {exc}"
+            async with file_lock:
+                cfg.results_path.parent.mkdir(parents=True, exist_ok=True)
+                with cfg.results_path.open("a", encoding="utf-8") as f:
+                    f.write(dumps_json(record) + "\n")
+            return
+
+        async with conn:
+            try:
+                sanity = await asyncio.wait_for(conn.run("echo fastssh_ok", check=False), timeout=cfg.read_timeout)
+                if sanity.exit_status != 0:
+                    raise RuntimeError(f"sanity command exit {sanity.exit_status}")
+            except Exception as exc:
+                record["error"] = f"post_sanity: {exc}"
+                async with file_lock:
+                    cfg.results_path.parent.mkdir(parents=True, exist_ok=True)
+                    with cfg.results_path.open("a", encoding="utf-8") as f:
+                        f.write(dumps_json(record) + "\n")
+                return
+
+            async with gather_sem:
+                extra = await gather_info(conn, cfg, host_state, state, state_lock)
+                record.update(extra)
+
+            async with file_lock:
+                cfg.results_path.parent.mkdir(parents=True, exist_ok=True)
+                with cfg.results_path.open("a", encoding="utf-8") as f:
+                    f.write(dumps_json(record) + "\n")
+
+    while True:
+        try:
+            rec = post_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+        tasks.append(asyncio.create_task(process(rec)))
+
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 # -----------------------------------------------------------------------------
 # Brute engine
 # -----------------------------------------------------------------------------
@@ -861,7 +932,8 @@ async def progress_reporter(
         return " | ".join(parts)
 
     status = await snapshot(time.monotonic())
-    print("\r" + status, end="", flush=True)
+    sys.stdout.write("\r" + status)
+    sys.stdout.flush()
     last_len = len(status)
 
     while not stop.is_set():
@@ -869,21 +941,23 @@ async def progress_reporter(
         now = time.monotonic()
         status = await snapshot(now)
         pad = " " * max(0, last_len - len(status))
-        print("\r" + status + pad, end="", flush=True)
+        sys.stdout.write("\r" + status + pad)
+        sys.stdout.flush()
         last_len = len(status)
 
         async with stats_lock:
             idle = now - stats.get("last_progress", start_time)
             pending_now = max(stats.get("total", 0) - (stats.get("attempts", 0) + stats.get("skipped", 0)), 0)
         if cfg.hang_timeout > 0 and idle > cfg.hang_timeout and pending_now > 0:
-            print(
-                f"\n[hang] No progress for {idle:.1f}s (threshold {cfg.hang_timeout}s). Draining queue and signaling stop.",
-                flush=True,
+            sys.stdout.write(
+                f"\n[hang] No progress for {idle:.1f}s (threshold {cfg.hang_timeout}s). Draining queue and signaling stop.\n"
             )
+            sys.stdout.flush()
             stop.set()
             global_stop.set()
             drain_queue(queue)
-    print()  # newline after final status
+    sys.stdout.write("\n")
+    sys.stdout.flush()
 
 
 async def run(cfg: Config) -> None:
