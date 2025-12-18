@@ -910,8 +910,16 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     results_target = args.results
     if not results_target or results_target == "results.jsonl":
-        results_target = f"results-{int(time.time())}.jsonl"
-    results_path = Path(results_target)
+        ts_struct = time.localtime()
+        stamp = time.strftime("%H.%M-%m.%d.%Y", ts_struct)
+        base = f"{stamp}-results.jsonl"
+        results_path = Path(base)
+        idx = 2
+        while results_path.exists():
+            results_path = Path(f"{idx}-{base}")
+            idx += 1
+    else:
+        results_path = Path(results_target)
     age_cache_path = Path(args.age_cache) if args.age_cache else (Path("age-cache.json") if args.gather_info else None)
     target_state_path = None
     if args.targets_state:
