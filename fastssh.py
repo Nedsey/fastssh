@@ -135,6 +135,10 @@ def collect_targets(
             return
         targets.setdefault(host, set()).update(ports)
 
+    def announce_resume(src: str, start: int, total: int) -> None:
+        if resume and total > 0 and start > 0:
+            print(f"[resume] {src}: starting at {start}/{total}", flush=True)
+
     # Inline targets
     for t in args.target or []:
         host, ports = parse_target(t, args.port)
@@ -149,6 +153,7 @@ def collect_targets(
         if start >= total:
             start = 0
         end = start + chunk if chunk else total
+        announce_resume(str(path), start, total)
         slice_lines = lines[start:end]
         for line in slice_lines:
             host, ports = parse_target(line, args.port)
@@ -171,6 +176,7 @@ def collect_targets(
         if start >= total:
             start = 0
         end = start + chunk if chunk else total
+        announce_resume(key, start, total)
         slice_data = data[start:end]
         for entry in slice_data:
             ip = entry.get("ip")
@@ -907,11 +913,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         results_target = f"results-{int(time.time())}.jsonl"
     results_path = Path(results_target)
     age_cache_path = Path(args.age_cache) if args.age_cache else (Path("age-cache.json") if args.gather_info else None)
-    target_state_path = (
-        Path(args.targets_state)
-        if args.targets_state
-        else (Path("targets-state.json") if args.targets else None)
-    )
+    target_state_path = None
+    if args.targets_state:
+        target_state_path = Path(args.targets_state)
+    elif args.targets or args.masscan_json:
+        target_state_path = Path("targets-state.json")
     target_state = load_target_state(target_state_path)
 
     targets, new_target_state = collect_targets(
