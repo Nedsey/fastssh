@@ -19,6 +19,7 @@ import shutil
 import contextlib
 import time
 import sys
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
@@ -94,6 +95,17 @@ class Config:
     post_light: bool = False  # collect lighter info set
     cpu_net: bool = True  # enable cpu/net sampling in status
     pretty_status: bool = True  # rich-based live status when available
+    auto_tune: bool = False
+    tune_window: float = 20.0
+    tune_min_workers: int = 50
+    tune_max_workers: int = 500
+    tune_step_workers: int = 25
+    tune_max_timeout_ratio: float = 0.25
+    tune_max_error_ratio: float = 0.15
+    tune_timeout_quantile: float = 0.9
+    tune_timeout_buffer: float = 0.5
+    tune_timeout_floor: float = 0.5
+    tune_timeout_ceiling: float = 15.0
 
 
 @dataclass
@@ -594,9 +606,9 @@ async def attempt_login(
     state_lock: asyncio.Lock,
     gather_sem: asyncio.Semaphore,
     post_queue: "asyncio.Queue[dict]",
-) -> None:
+) -> str:
     if global_stop.is_set() or host_state.stop.is_set():
-        return
+        return "skipped"
 
     try:
         conn = await asyncssh.connect(
@@ -618,20 +630,20 @@ async def attempt_login(
             stats["last_progress"] = time.monotonic()
         if cfg.verbose:
             print(f"[warn] auth failed {item.host}:{item.port} {item.user}:{item.password} ({exc})", flush=True)
-        return
+        return "failure"
     except OSError as exc:
         async with stats_lock:
             stats["failures"] += 1
             stats["last_progress"] = time.monotonic()
         if cfg.verbose:
             print(f"[warn] connection error {item.host}:{item.port} ({exc})", flush=True)
-        return
+        return "failure"
     except Exception as exc:
         async with stats_lock:
             stats["errors"] += 1
             stats["last_progress"] = time.monotonic()
         print(f"[error] unexpected error before auth {item.host}:{item.port}: {exc}", flush=True)
-        return
+        return "error"
 
     async with conn:
         # Sanity check that we can actually run a trivial command; if not, treat as failure.
@@ -647,7 +659,7 @@ async def attempt_login(
                 stats["last_progress"] = time.monotonic()
             if cfg.verbose:
                 print(f"[warn] session unusable after auth {item.host}:{item.port}: {exc}", flush=True)
-            return
+            return "failure"
 
         record = {
             "host": item.host,
@@ -697,6 +709,7 @@ async def attempt_login(
             host_state.stop.set()
         if cfg.stop_first_global:
             global_stop.set()
+        return "success"
 
 
 async def worker(
@@ -711,6 +724,7 @@ async def worker(
     state_lock: asyncio.Lock,
     gather_sem: asyncio.Semaphore,
     post_queue: "asyncio.Queue[dict]",
+    history: deque,
 ) -> None:
     while True:
         item = await queue.get()
@@ -725,11 +739,22 @@ async def worker(
             queue.task_done()
             continue
 
-        async with stats_lock:
-            stats["active"] += 1
+        # respect tuner-adjusted worker cap
+        while True:
+            async with stats_lock:
+                allowed = int(stats.get("allowed_workers", cfg.max_workers))
+                active_now = stats["active"]
+            if active_now < allowed:
+                async with stats_lock:
+                    stats["active"] += 1
+                break
+            await asyncio.sleep(0.01)
+
+        outcome = "error"
+        start_ts = time.monotonic()
         try:
             if cfg.attempt_timeout and cfg.attempt_timeout > 0:
-                await asyncio.wait_for(
+                outcome = await asyncio.wait_for(
                     attempt_login(
                         item,
                         cfg,
@@ -746,7 +771,7 @@ async def worker(
                     timeout=cfg.attempt_timeout,
                 )
             else:
-                await attempt_login(
+                outcome = await attempt_login(
                     item,
                     cfg,
                     host_states[item.host],
@@ -768,6 +793,7 @@ async def worker(
                     f"[warn] attempt watchdog timeout {item.host}:{item.port} after {cfg.attempt_timeout:.1f}s",
                     flush=True,
                 )
+            outcome = "timeout"
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -776,6 +802,9 @@ async def worker(
                 stats["last_progress"] = time.monotonic()
             print(f"[error] worker crash avoided for {item.host}:{item.port}: {exc}", flush=True)
         finally:
+            duration = time.monotonic() - start_ts
+            async with stats_lock:
+                history.append((time.monotonic(), duration, outcome))
             async with stats_lock:
                 stats["active"] = max(0, stats["active"] - 1)
                 stats["attempts"] += 1
@@ -892,6 +921,7 @@ async def progress_reporter(
     stop: asyncio.Event,
     global_stop: asyncio.Event,
     post_queue: "asyncio.Queue[dict]",
+    history: deque,
 ) -> None:
     start_time = time.monotonic()
     clear_line = "\r\x1b[K"
@@ -959,6 +989,7 @@ async def progress_reporter(
     net_rates: Tuple[Optional[float], Optional[float]] = (None, None)
     interval = cfg.status_interval if cfg.status_interval else cfg.log_interval
     interval = interval if interval and interval > 0 else 1.0
+    window = cfg.tune_window if cfg.tune_window > 0 else 20.0
 
     async def snapshot(now: float) -> Dict[str, Any]:
         nonlocal prev_cpu, prev_net, prev_sample_t, cpu_percent, net_rates
@@ -988,6 +1019,7 @@ async def progress_reporter(
             skipped = int(stats.get("skipped", 0))
             timeouts = int(stats.get("timeouts", 0))
             active = int(stats.get("active", 0))
+            allowed_workers = int(stats.get("allowed_workers", cfg.max_workers))
             total = int(stats.get("total", 0))
             last_progress = stats.get("last_progress", start_time)
         elapsed = now - start_time
@@ -1006,6 +1038,12 @@ async def progress_reporter(
         else:
             net_str = "n/a"
         post_pending = post_queue.qsize() if cfg.gather_info and cfg.post_process else 0
+        cutoff = now - window
+        recent = [h for h in history if h[0] >= cutoff]
+        sps = len(recent) / window if window > 0 else 0.0
+        timeouts_r = (sum(1 for _, _, o in recent if o == "timeout") / len(recent)) if recent else 0.0
+        errors_r = (sum(1 for _, _, o in recent if o == "error") / len(recent)) if recent else 0.0
+        tuner_note = stats.get("tuner_note", "")
         return {
             "elapsed": elapsed,
             "idle": idle,
@@ -1023,8 +1061,13 @@ async def progress_reporter(
             "timeouts": timeouts,
             "errors": errors,
             "active": active,
+            "allowed_workers": allowed_workers,
             "total": total,
             "eta": eta_str,
+            "sps": sps,
+            "timeouts_r": timeouts_r,
+            "errors_r": errors_r,
+            "tuner_note": tuner_note,
         }
 
     def render_plain(metrics: Dict[str, Any]) -> str:
@@ -1032,16 +1075,19 @@ async def progress_reporter(
         status = (
             f"[status] {bar} {metrics['done']}/{metrics['total']}"
             f" | rate {metrics['rate']:.2f}/s"
+            f" | sps {metrics['sps']:.2f}/s"
             f" | eta {metrics['eta']}"
-            f" | active {metrics['active']}/{cfg.max_workers} q {metrics['qsize']} pend {metrics['pending']}"
+            f" | active {metrics['active']}/{metrics['allowed_workers']} (max {cfg.max_workers}) q {metrics['qsize']} pend {metrics['pending']}"
             f" | succ {metrics['successes']} fail {metrics['failures']} skip {metrics['skipped']} timeouts {metrics['timeouts']} err {metrics['errors']}"
-            f" | sr {metrics['success_rate']:.2%}"
+            f" | sr {metrics['success_rate']:.2%} to {metrics['timeouts_r']:.1%} err {metrics['errors_r']:.1%}"
             f" | cpu {metrics['cpu_str']}"
             f" | net {metrics['net_str']}"
             f" | idle {metrics['idle']:.1f}s"
         )
         if metrics["post_pending"]:
             status += f" | post {metrics['post_pending']}"
+        if metrics["tuner_note"]:
+            status += f" | tuner {metrics['tuner_note']}"
         cols = shutil.get_terminal_size(fallback=(120, 20)).columns
         if cols > 0 and len(status) >= cols:
             max_len = max(10, cols - 1)
@@ -1053,17 +1099,19 @@ async def progress_reporter(
         progress.update(task_id, completed=metrics["done"], total=total)
         grid = Table.grid(expand=True)
         grid.add_row(
-            f"[cyan]Rate[/] {metrics['rate']:.2f}/s | ETA {metrics['eta']} | Idle {metrics['idle']:.1f}s",
-            f"[magenta]Active[/] {metrics['active']}/{cfg.max_workers} q {metrics['qsize']} pend {metrics['pending']}",
+            f"[cyan]Rate[/] {metrics['rate']:.2f}/s | SPS {metrics['sps']:.2f}/s | ETA {metrics['eta']} | Idle {metrics['idle']:.1f}s",
+            f"[magenta]Active[/] {metrics['active']}/{metrics['allowed_workers']} (max {cfg.max_workers}) q {metrics['qsize']} pend {metrics['pending']}",
         )
         grid.add_row(
             f"[green]Succ[/] {metrics['successes']} [red]Fail[/] {metrics['failures']} [yellow]Skip[/] {metrics['skipped']}",
-            f"[bright_black]Timeouts[/] {metrics['timeouts']} [red]Err[/] {metrics['errors']} [blue]SR[/] {metrics['success_rate']:.2%}",
+            f"[bright_black]Timeouts[/] {metrics['timeouts']} ({metrics['timeouts_r']:.1%}) [red]Err[/] {metrics['errors']} ({metrics['errors_r']:.1%}) [blue]SR[/] {metrics['success_rate']:.2%}",
         )
         grid.add_row(
             f"[blue]CPU[/] {metrics['cpu_str']} | Net {metrics['net_str']}",
             f"[cyan]Post[/] {metrics['post_pending']}" if metrics["post_pending"] else "",
         )
+        if metrics["tuner_note"]:
+            grid.add_row(f"[bright_black]Tuner[/] {metrics['tuner_note']}", "")
         return Panel(Group(progress, grid), title="[bold]fastssh status[/]", border_style="cyan")
 
     metrics = await snapshot(time.monotonic())
@@ -1133,6 +1181,88 @@ async def progress_reporter(
     sys.stdout.flush()
 
 
+def percentile(data: List[float], q: float) -> Optional[float]:
+    if not data:
+        return None
+    if q <= 0:
+        return min(data)
+    if q >= 1:
+        return max(data)
+    xs = sorted(data)
+    k = (len(xs) - 1) * q
+    f = int(k)
+    c = min(f + 1, len(xs) - 1)
+    if f == c:
+        return xs[f]
+    return xs[f] + (xs[c] - xs[f]) * (k - f)
+
+
+async def auto_tuner(
+    cfg: Config,
+    stats: Dict[str, float],
+    stats_lock: asyncio.Lock,
+    history: deque,
+    stop: asyncio.Event,
+    global_stop: asyncio.Event,
+) -> None:
+    window = cfg.tune_window if cfg.tune_window > 0 else 20.0
+    step_workers = max(1, cfg.tune_step_workers)
+    last_sps = 0.0
+    last_note = "init"
+    while not stop.is_set():
+        await asyncio.sleep(window / 2)
+        now = time.monotonic()
+        async with stats_lock:
+            snapshot_history = list(history)
+            allowed_workers = int(stats.get("allowed_workers", cfg.max_workers))
+        cutoff = now - window
+        recent = [h for h in snapshot_history if h[0] >= cutoff]
+        if not recent or len(recent) < 10:
+            continue
+        span = max(recent[-1][0] - recent[0][0], 1.0)
+        sps = len(recent) / span
+        timeouts = sum(1 for _, _, o in recent if o == "timeout")
+        errors = sum(1 for _, _, o in recent if o == "error")
+        successes = sum(1 for _, _, o in recent if o == "success")
+        timeout_ratio = timeouts / len(recent)
+        error_ratio = errors / len(recent)
+
+        new_workers = allowed_workers
+        note_parts = []
+        # worker adjustment
+        if timeout_ratio > cfg.tune_max_timeout_ratio or error_ratio > cfg.tune_max_error_ratio:
+            new_workers = max(cfg.tune_min_workers, allowed_workers - step_workers)
+            note_parts.append(f"backoff workers {allowed_workers}->{new_workers} (to {timeout_ratio:.1%} err {error_ratio:.1%})")
+        elif sps > last_sps * 1.05 and allowed_workers < cfg.tune_max_workers:
+            new_workers = min(cfg.tune_max_workers, allowed_workers + step_workers)
+            note_parts.append(f"raise workers {allowed_workers}->{new_workers} (sps {sps:.2f})")
+        else:
+            note_parts.append(f"hold workers {allowed_workers} (sps {sps:.2f})")
+
+        # timeout adjustment based on duration quantile of non-timeout attempts
+        durations = [d for _, d, o in recent if o not in ("timeout", "skipped")]
+        q = percentile(durations, cfg.tune_timeout_quantile)
+        if q is not None:
+            target_total = min(cfg.tune_timeout_ceiling, max(cfg.tune_timeout_floor, q + cfg.tune_timeout_buffer))
+            # keep a little margin to avoid flapping
+            if abs(target_total - cfg.attempt_timeout) > 0.25:
+                cfg.attempt_timeout = target_total
+                cfg.connect_timeout = min(cfg.tune_timeout_ceiling, max(cfg.tune_timeout_floor, target_total * 0.35))
+                cfg.auth_timeout = min(cfg.tune_timeout_ceiling, max(cfg.tune_timeout_floor, target_total * 0.45))
+                cfg.read_timeout = min(cfg.tune_timeout_ceiling, max(cfg.tune_timeout_floor, target_total * 0.25))
+                note_parts.append(f"timeouts -> {target_total:.2f}s (q{int(cfg.tune_timeout_quantile*100)} {q:.2f}s)")
+
+        note = "; ".join(note_parts)
+        async with stats_lock:
+            stats["allowed_workers"] = max(cfg.tune_min_workers, min(cfg.tune_max_workers, new_workers))
+            stats["tuner_note"] = note
+        last_sps = sps
+        last_note = note
+
+        # safety: if global stop set, exit
+        if global_stop.is_set():
+            break
+
 async def run(cfg: Config) -> None:
     host_states: Dict[str, HostState] = {}
     await probe_targets(cfg, host_states)
@@ -1146,6 +1276,7 @@ async def run(cfg: Config) -> None:
     state_lock = asyncio.Lock()
     state: Dict[str, Any] = {"age_cache": load_age_cache(cfg.age_cache)}
     gather_sem = asyncio.Semaphore(max(1, cfg.gather_concurrency))
+    history: deque = deque(maxlen=10000)
     stats: Dict[str, float] = {
         "attempts": 0,
         "successes": 0,
@@ -1156,6 +1287,8 @@ async def run(cfg: Config) -> None:
         "active": 0,
         "total": count_work_items(cfg),
         "last_progress": time.monotonic(),
+        "allowed_workers": cfg.max_workers,
+        "tuner_note": "",
     }
 
     workers = [
@@ -1172,12 +1305,19 @@ async def run(cfg: Config) -> None:
                 state_lock,
                 gather_sem,
                 post_queue,
+                history,
             )
         )
         for _ in range(cfg.max_workers)
     ]
     reporter_stop = asyncio.Event()
-    reporter = asyncio.create_task(progress_reporter(cfg, stats, stats_lock, queue, reporter_stop, global_stop, post_queue))
+    reporter = asyncio.create_task(
+        progress_reporter(cfg, stats, stats_lock, queue, reporter_stop, global_stop, post_queue, history)
+    )
+    tuner_stop = asyncio.Event()
+    tuner: Optional[asyncio.Task] = None
+    if cfg.auto_tune:
+        tuner = asyncio.create_task(auto_tuner(cfg, stats, stats_lock, history, tuner_stop, global_stop))
 
     print("[info] Building work queue...", flush=True)
     await build_queue(cfg, queue, host_states, global_stop)
@@ -1192,6 +1332,10 @@ async def run(cfg: Config) -> None:
         global_stop.set()
         reporter_stop.set()
         await reporter
+        if tuner:
+            tuner_stop.set()
+            with contextlib.suppress(Exception):
+                await tuner
         for w in workers:
             w.cancel()
         with contextlib.suppress(Exception):
@@ -1259,6 +1403,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--post-light", action="store_true", help="lightweight post-auth info (smaller command set)")
     p.add_argument("--no-post-process", action="store_true", help="run gather-info inline instead of post phase")
     p.add_argument("--no-cpu-net", action="store_true", help="disable CPU/net sampling in status")
+    p.add_argument("--auto-tune", action="store_true", help="enable SPS auto-tuner for workers/timeouts")
+    p.add_argument("--tune-window", type=float, default=20.0, help="rolling window (seconds) for SPS tuning")
+    p.add_argument("--tune-min-workers", type=int, default=50, help="lower bound for auto-tuned workers")
+    p.add_argument("--tune-max-workers", type=int, default=500, help="upper bound for auto-tuned workers")
+    p.add_argument("--tune-step-workers", type=int, default=25, help="step size when adjusting workers")
+    p.add_argument("--tune-max-timeout-ratio", type=float, default=0.25, help="cap on timeout fraction before backing off")
+    p.add_argument("--tune-max-error-ratio", type=float, default=0.15, help="cap on error fraction before backing off")
+    p.add_argument("--tune-timeout-quantile", type=float, default=0.9, help="quantile of durations to set timeout targets")
+    p.add_argument("--tune-timeout-buffer", type=float, default=0.5, help="extra seconds added on top of quantile when shrinking timeouts")
+    p.add_argument("--tune-timeout-floor", type=float, default=0.5, help="minimum timeout values")
+    p.add_argument("--tune-timeout-ceiling", type=float, default=15.0, help="maximum timeout values")
     # Note: a short sanity command runs after auth to ensure the session can execute commands; failures are treated as auth failures.
     return p
 
@@ -1388,6 +1543,17 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         post_process=not args.no_post_process,
         cpu_net=not args.no_cpu_net,
         pretty_status=not args.no_pretty_status,
+        auto_tune=args.auto_tune,
+        tune_window=args.tune_window,
+        tune_min_workers=args.tune_min_workers,
+        tune_max_workers=args.tune_max_workers,
+        tune_step_workers=args.tune_step_workers,
+        tune_max_timeout_ratio=args.tune_max_timeout_ratio,
+        tune_max_error_ratio=args.tune_max_error_ratio,
+        tune_timeout_quantile=args.tune_timeout_quantile,
+        tune_timeout_buffer=args.tune_timeout_buffer,
+        tune_timeout_floor=args.tune_timeout_floor,
+        tune_timeout_ceiling=args.tune_timeout_ceiling,
     )
 
     try:
