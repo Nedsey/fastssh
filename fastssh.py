@@ -40,6 +40,7 @@ class Config:
     combos: List[Tuple[str, str]] = field(default_factory=list)
     target_state: Dict[str, int] = field(default_factory=dict)
     target_state_path: Optional[Path] = None
+    target_updates: Dict[str, int] = field(default_factory=dict)
     resume_targets: bool = True
     connect_timeout: float = 3.0
     auth_timeout: float = 5.0
@@ -132,9 +133,10 @@ def collect_targets(
     target_state: Dict[str, int],
     resume: bool,
     chunk: Optional[int],
-) -> Tuple[Dict[str, Set[int]], Dict[str, int]]:
+) -> Tuple[Dict[str, Set[int]], Dict[str, int], Dict[str, int]]:
     targets: Dict[str, Set[int]] = {}
     new_state = dict(target_state)
+    planned_updates: Dict[str, int] = {}
 
     def add_target(host: str, ports: Iterable[int]) -> None:
         if not host:
@@ -166,7 +168,7 @@ def collect_targets(
             add_target(host, ports)
         if total > 0 and resume:
             new_offset = end if end < total else 0
-            new_state[str(path)] = new_offset
+            planned_updates[str(path)] = new_offset
 
     # masscan JSON ingestion
     if args.masscan_json:
@@ -192,7 +194,7 @@ def collect_targets(
                 add_target(ip, [int(port_info.get("port", args.port))])
         if total > 0 and resume:
             new_offset = end if end < total else 0
-            new_state[key] = new_offset
+            planned_updates[key] = new_offset
 
     # Random public IPv4 generation
     for _ in range(args.random or 0):
@@ -204,7 +206,7 @@ def collect_targets(
     if not targets:
         raise SystemExit("No targets provided.")
 
-    return targets, new_state
+    return targets, new_state, planned_updates
 
 
 def load_creds(args: argparse.Namespace) -> List[Tuple[str, str]]:
@@ -755,6 +757,8 @@ async def progress_reporter(
     start_time = time.monotonic()
 
     def read_cpu() -> Optional[Tuple[int, int]]:
+        if not cfg.cpu_net:
+            return None
         try:
             with open("/proc/stat", "r", encoding="utf-8") as f:
                 parts = f.readline().strip().split()
@@ -768,6 +772,8 @@ async def progress_reporter(
             return None
 
     def read_net() -> Optional[Tuple[int, int]]:
+        if not cfg.cpu_net:
+            return None
         try:
             rx = tx = 0
             with open("/proc/net/dev", "r", encoding="utf-8") as f:
@@ -792,6 +798,7 @@ async def progress_reporter(
     prev_sample_t = time.monotonic()
     cpu_percent: Optional[float] = None
     net_rates: Tuple[Optional[float], Optional[float]] = (None, None)
+    last_len = 0
 
     async def snapshot(now: float) -> str:
         nonlocal prev_cpu, prev_net, prev_sample_t, cpu_percent, net_rates
@@ -853,12 +860,17 @@ async def progress_reporter(
             parts.append(f"post {post_pending}")
         return " | ".join(parts)
 
-    print(await snapshot(time.monotonic()), end="", flush=True)
+    status = await snapshot(time.monotonic())
+    print("\r" + status, end="", flush=True)
+    last_len = len(status)
 
     while not stop.is_set():
         await asyncio.sleep(min(cfg.status_interval, cfg.log_interval))
         now = time.monotonic()
-        print(await snapshot(now), end="", flush=True)
+        status = await snapshot(now)
+        pad = " " * max(0, last_len - len(status))
+        print("\r" + status + pad, end="", flush=True)
+        last_len = len(status)
 
         async with stats_lock:
             idle = now - stats.get("last_progress", start_time)
@@ -871,7 +883,7 @@ async def progress_reporter(
             stop.set()
             global_stop.set()
             drain_queue(queue)
-    print()
+    print()  # newline after final status
 
 
 async def run(cfg: Config) -> None:
@@ -924,8 +936,10 @@ async def run(cfg: Config) -> None:
     print("[info] Work queue built, processing...", flush=True)
     try:
         await queue.join()
+        completed = True
     except KeyboardInterrupt:
         print("\n[info] Interrupt received, shutting down gracefully...", flush=True)
+        completed = False
     finally:
         global_stop.set()
         reporter_stop.set()
@@ -940,6 +954,8 @@ async def run(cfg: Config) -> None:
         with contextlib.suppress(Exception):
             save_age_cache(cfg.age_cache, state.get("age_cache", {}))
         with contextlib.suppress(Exception):
+            if completed:
+                cfg.target_state.update(cfg.target_updates)
             save_target_state(cfg.target_state_path, cfg.target_state)
 
 
@@ -1068,7 +1084,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         target_state_path = Path("targets-state.json")
     target_state = load_target_state(target_state_path)
 
-    targets, new_target_state = collect_targets(
+    targets, new_target_state, target_updates = collect_targets(
         args,
         target_state=target_state,
         resume=not args.no_resume,
@@ -1079,6 +1095,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         targets=targets,
         target_state=new_target_state,
         target_state_path=target_state_path,
+        target_updates=target_updates,
         combos=load_creds(args),
         connect_timeout=args.connect_timeout,
         auth_timeout=args.auth_timeout,
