@@ -1,3 +1,4 @@
 asyncssh>=2.14.0
+ssh2-python>=1.0.0
 orjson>=3.9.5
 rich>=13.7.0

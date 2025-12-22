@@ -15,6 +15,7 @@ import ipaddress
 import json
 import os
 import random
+import socket
 import shutil
 import contextlib
 import time
@@ -29,6 +30,17 @@ except ImportError:
     orjson = None
 
 import asyncssh
+try:
+    from ssh2.session import Session as SSH2Session
+    from ssh2.exceptions import AuthenticationError as SSH2AuthError, SSH2Error
+
+    SSH2_AVAILABLE = True
+except Exception:
+    SSH2Session = None
+    SSH2AuthError = None
+    SSH2Error = Exception
+    SSH2_AVAILABLE = False
+
 try:
     from rich.console import Console, Group
     from rich.live import Live
@@ -94,6 +106,7 @@ class Config:
     post_light: bool = False  # collect lighter info set
     cpu_net: bool = True  # enable cpu/net sampling in status
     pretty_status: bool = True  # rich-based live status when available
+    auth_backend: str = "ssh2"  # ssh2 (libssh2) or asyncssh
 
 
 @dataclass
@@ -108,6 +121,16 @@ class WorkItem:
 class HostState:
     stop: asyncio.Event = field(default_factory=asyncio.Event)
     banner: Optional[str] = None
+
+
+@dataclass
+class AuthResult:
+    ok: bool
+    banner: Optional[str] = None
+    error: Optional[str] = None
+    auth_failed: bool = False
+    transport_error: bool = False
+    conn: Optional[asyncssh.SSHClientConnection] = None
 
 
 def load_lines(path: Path) -> List[str]:
@@ -328,6 +351,123 @@ async def probe_port(host: str, port: int, timeout: float) -> Optional[str]:
         with contextlib.suppress(Exception):
             await writer.wait_closed()
         return banner
+    except Exception:
+        return None
+
+
+# -----------------------------------------------------------------------------
+# Auth backends
+# -----------------------------------------------------------------------------
+
+
+def _remaining_timeout(deadline: Optional[float], default_val: float) -> float:
+    if not deadline:
+        return default_val
+    remaining = deadline - time.monotonic()
+    return max(0.1, remaining)
+
+
+def ssh2_authenticate(item: WorkItem, cfg: Config) -> AuthResult:
+    if not SSH2_AVAILABLE:
+        return AuthResult(ok=False, error="ssh2_backend_unavailable", transport_error=True)
+
+    deadline = time.monotonic() + cfg.attempt_timeout if cfg.attempt_timeout else None
+    sock: Optional[socket.socket] = None
+    banner: Optional[str] = None
+    try:
+        sock = socket.create_connection(
+            (item.host, item.port),
+            timeout=_remaining_timeout(deadline, cfg.connect_timeout),
+        )
+        sock.settimeout(_remaining_timeout(deadline, cfg.auth_timeout))
+        session = SSH2Session()
+        session.handshake(sock)
+        try:
+            raw_banner = getattr(session, "banner", None) or getattr(session, "remote_banner", None)
+            if callable(raw_banner):
+                raw_banner = raw_banner()
+            if raw_banner:
+                banner = raw_banner.decode(errors="ignore") if isinstance(raw_banner, (bytes, bytearray)) else str(raw_banner)
+        except Exception:
+            banner = None
+
+        session.userauth_password(item.user, item.password)
+        if not session.userauth_authenticated():
+            return AuthResult(ok=False, banner=banner, auth_failed=True)
+        return AuthResult(ok=True, banner=banner)
+    except SSH2AuthError as exc:
+        return AuthResult(ok=False, banner=banner, auth_failed=True, error=str(exc))
+    except (socket.timeout, TimeoutError) as exc:
+        return AuthResult(ok=False, banner=banner, transport_error=True, error=f"timeout: {exc}")
+    except OSError as exc:
+        return AuthResult(ok=False, banner=banner, transport_error=True, error=str(exc))
+    except SSH2Error as exc:
+        return AuthResult(ok=False, banner=banner, transport_error=True, error=str(exc))
+    except Exception as exc:
+        return AuthResult(ok=False, banner=banner, transport_error=True, error=str(exc))
+    finally:
+        with contextlib.suppress(Exception):
+            if sock:
+                sock.close()
+
+
+async def auth_with_ssh2(item: WorkItem, cfg: Config) -> AuthResult:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, ssh2_authenticate, item, cfg)
+
+
+async def auth_with_asyncssh(item: WorkItem, cfg: Config, host_state: HostState) -> AuthResult:
+    try:
+        conn = await asyncssh.connect(
+            item.host,
+            port=item.port,
+            username=item.user,
+            password=item.password,
+            known_hosts=None,
+            client_keys=[],
+            login_timeout=cfg.auth_timeout,
+            connect_timeout=cfg.connect_timeout,
+            compression_algs=["none"],
+        )
+    except asyncio.CancelledError:
+        raise
+    except (asyncssh.PermissionDenied, asyncssh.misc.DisconnectError, asyncio.TimeoutError) as exc:
+        return AuthResult(ok=False, auth_failed=True, error=str(exc))
+    except OSError as exc:
+        return AuthResult(ok=False, transport_error=True, error=str(exc))
+    except Exception as exc:
+        return AuthResult(ok=False, transport_error=True, error=str(exc))
+
+    try:
+        sanity = await asyncio.wait_for(conn.run("echo fastssh_ok", check=False), timeout=cfg.read_timeout)
+        if sanity.exit_status != 0:
+            raise RuntimeError(f"sanity command exit {sanity.exit_status}")
+    except asyncio.CancelledError:
+        with contextlib.suppress(Exception):
+            conn.close()
+        raise
+    except Exception as exc:
+        with contextlib.suppress(Exception):
+            conn.close()
+        return AuthResult(ok=False, auth_failed=True, error=str(exc))
+
+    banner = host_state.banner
+    return AuthResult(ok=True, banner=banner, conn=conn)
+
+
+async def open_asyncssh_session(item: WorkItem, cfg: Config) -> Optional[asyncssh.SSHClientConnection]:
+    try:
+        return await asyncssh.connect(
+            item.host,
+            port=item.port,
+            username=item.user,
+            password=item.password,
+            known_hosts=None,
+            client_keys=[],
+            login_timeout=cfg.auth_timeout,
+            connect_timeout=cfg.connect_timeout,
+            compression_algs=["none"],
+        )
     except Exception:
         return None
 
@@ -598,105 +738,97 @@ async def attempt_login(
     if global_stop.is_set() or host_state.stop.is_set():
         return
 
-    try:
-        conn = await asyncssh.connect(
-            item.host,
-            port=item.port,
-            username=item.user,
-            password=item.password,
-            known_hosts=None,
-            client_keys=[],
-            login_timeout=cfg.auth_timeout,
-            connect_timeout=cfg.connect_timeout,
-            compression_algs=["none"],
-        )
-    except asyncio.CancelledError:
-        raise
-    except (asyncssh.PermissionDenied, asyncssh.misc.DisconnectError, asyncio.TimeoutError) as exc:
-        async with stats_lock:
-            stats["failures"] += 1
-            stats["last_progress"] = time.monotonic()
-        if cfg.verbose:
-            print(f"[warn] auth failed {item.host}:{item.port} {item.user}:{item.password} ({exc})", flush=True)
-        return
-    except OSError as exc:
-        async with stats_lock:
-            stats["failures"] += 1
-            stats["last_progress"] = time.monotonic()
-        if cfg.verbose:
-            print(f"[warn] connection error {item.host}:{item.port} ({exc})", flush=True)
-        return
-    except Exception as exc:
-        async with stats_lock:
-            stats["errors"] += 1
-            stats["last_progress"] = time.monotonic()
-        print(f"[error] unexpected error before auth {item.host}:{item.port}: {exc}", flush=True)
-        return
+    backend = cfg.auth_backend
+    if backend == "ssh2" and not SSH2_AVAILABLE:
+        backend = "asyncssh"
 
-    async with conn:
-        # Sanity check that we can actually run a trivial command; if not, treat as failure.
-        try:
-            sanity = await asyncio.wait_for(conn.run("echo fastssh_ok", check=False), timeout=cfg.read_timeout)
-            if sanity.exit_status != 0:
-                raise RuntimeError(f"sanity command exit {sanity.exit_status}")
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            async with stats_lock:
+    if backend == "ssh2":
+        auth_result = await auth_with_ssh2(item, cfg)
+    else:
+        auth_result = await auth_with_asyncssh(item, cfg, host_state)
+
+    if not auth_result.ok:
+        async with stats_lock:
+            if auth_result.auth_failed or auth_result.transport_error:
                 stats["failures"] += 1
-                stats["last_progress"] = time.monotonic()
-            if cfg.verbose:
-                print(f"[warn] session unusable after auth {item.host}:{item.port}: {exc}", flush=True)
-            return
+            else:
+                stats["errors"] += 1
+            stats["last_progress"] = time.monotonic()
+        if cfg.verbose:
+            reason = auth_result.error or "auth failed"
+            print(f"[warn] auth failed {item.host}:{item.port} {item.user}:{item.password} ({reason})", flush=True)
+        if auth_result.conn:
+            with contextlib.suppress(Exception):
+                auth_result.conn.close()
+        return
 
-        record = {
-            "host": item.host,
-            "port": item.port,
-            "user": item.user,
-            "password": item.password,
-        }
+    if auth_result.banner and not host_state.banner:
+        host_state.banner = auth_result.banner
 
-        if cfg.command:
-            try:
-                result = await asyncio.wait_for(conn.run(cfg.command, check=False), timeout=cfg.read_timeout)
-                if cfg.command_output:
-                    record["command"] = cfg.command
-                    record["stdout"] = result.stdout
-                    record["stderr"] = result.stderr
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
+    record = {
+        "host": item.host,
+        "port": item.port,
+        "user": item.user,
+        "password": item.password,
+    }
+
+    if host_state.banner:
+        record["banner"] = host_state.banner
+
+    conn = auth_result.conn
+    needs_inline_conn = bool(cfg.command or (cfg.gather_info and not cfg.post_process))
+
+    if needs_inline_conn and conn is None:
+        conn = await open_asyncssh_session(item, cfg)
+        if conn is None:
+            if cfg.command:
                 record["command"] = cfg.command
                 record["stdout"] = ""
-                record["stderr"] = f"<command error: {exc}>"
+                record["stderr"] = "<command error: failed to open session>"
+            if cfg.gather_info and not cfg.post_process:
+                record["gather_error"] = "failed to open session"
 
-        if host_state.banner:
-            record["banner"] = host_state.banner
+    if conn and needs_inline_conn:
+        async with conn:
+            if cfg.command:
+                try:
+                    result = await asyncio.wait_for(conn.run(cfg.command, check=False), timeout=cfg.read_timeout)
+                    if cfg.command_output:
+                        record["command"] = cfg.command
+                        record["stdout"] = result.stdout
+                        record["stderr"] = result.stderr
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    record["command"] = cfg.command
+                    record["stdout"] = ""
+                    record["stderr"] = f"<command error: {exc}>"
 
-        if cfg.gather_info and cfg.post_process:
-            await post_queue.put(record)
-        elif cfg.gather_info:
-            async with gather_sem:
-                extra = await gather_info(conn, cfg, host_state, state, state_lock)
-                record.update(extra)
-            async with file_lock:
-                cfg.results_path.parent.mkdir(parents=True, exist_ok=True)
-                with cfg.results_path.open("a", encoding="utf-8") as f:
-                    f.write(dumps_json(record) + "\n")
-        else:
-            async with file_lock:
-                cfg.results_path.parent.mkdir(parents=True, exist_ok=True)
-                with cfg.results_path.open("a", encoding="utf-8") as f:
-                    f.write(dumps_json(record) + "\n")
+            if cfg.gather_info and not cfg.post_process:
+                async with gather_sem:
+                    extra = await gather_info(conn, cfg, host_state, state, state_lock)
+                    record.update(extra)
+    elif conn and not needs_inline_conn:
+        conn.close()
+        with contextlib.suppress(Exception):
+            await conn.wait_closed()
 
-        async with stats_lock:
-            stats["successes"] += 1
-            stats["last_progress"] = time.monotonic()
+    if cfg.gather_info and cfg.post_process:
+        await post_queue.put(record)
+    else:
+        async with file_lock:
+            cfg.results_path.parent.mkdir(parents=True, exist_ok=True)
+            with cfg.results_path.open("a", encoding="utf-8") as f:
+                f.write(dumps_json(record) + "\n")
 
-        if cfg.stop_first_host:
-            host_state.stop.set()
-        if cfg.stop_first_global:
-            global_stop.set()
+    async with stats_lock:
+        stats["successes"] += 1
+        stats["last_progress"] = time.monotonic()
+
+    if cfg.stop_first_host:
+        host_state.stop.set()
+    if cfg.stop_first_global:
+        global_stop.set()
 
 
 async def worker(
@@ -802,13 +934,17 @@ async def build_queue(
 
     try:
         for host, ports in hosts:
+            if global_stop.is_set():
+                break
             host_states.setdefault(host, HostState())
             port_list = list(ports)
             if cfg.shuffle:
                 random.shuffle(port_list)
             for port in port_list:
+                if global_stop.is_set() or host_states[host].stop.is_set():
+                    break
                 for user, pwd in combos:
-                    if global_stop.is_set():
+                    if global_stop.is_set() or host_states[host].stop.is_set():
                         break
                     await queue.put(WorkItem(host, port, user, pwd))
     finally:
@@ -1259,6 +1395,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--post-light", action="store_true", help="lightweight post-auth info (smaller command set)")
     p.add_argument("--no-post-process", action="store_true", help="run gather-info inline instead of post phase")
     p.add_argument("--no-cpu-net", action="store_true", help="disable CPU/net sampling in status")
+    p.add_argument(
+        "--auth-backend",
+        choices=["ssh2", "asyncssh"],
+        default="ssh2",
+        help="authentication backend (ssh2/libssh2 is faster; asyncssh available as fallback)",
+    )
     # Note: a short sanity command runs after auth to ensure the session can execute commands; failures are treated as auth failures.
     return p
 
@@ -1347,6 +1489,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     if attempt_timeout is None or attempt_timeout <= 0:
         attempt_timeout = args.connect_timeout + args.auth_timeout + args.read_timeout + 1.0
 
+    auth_backend = args.auth_backend
+    if auth_backend == "ssh2" and not SSH2_AVAILABLE:
+        print("[info] ssh2-python not available, falling back to asyncssh backend", flush=True)
+        auth_backend = "asyncssh"
+
     targets, new_target_state, target_updates = collect_targets(
         args,
         target_state=target_state,
@@ -1388,6 +1535,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         post_process=not args.no_post_process,
         cpu_net=not args.no_cpu_net,
         pretty_status=not args.no_pretty_status,
+        auth_backend=auth_backend,
     )
 
     try:

@@ -12,6 +12,8 @@ structured and deduped for easy resumption.
   hand-rolled loops.
 - Credential expansion from user/password lists or combo files with dedupe.
 - Concurrency controls (global and per-host) plus stop-after-first options.
+- Default auth backend uses libssh2 (`ssh2-python`) for faster handshakes;
+  switch with `--auth-backend asyncssh` if desired.
 - Structured results (JSONL) with banners/command output when requested.
 - Minimal dependencies: `asyncssh` for SSH, `orjson` for fast logging.
 
