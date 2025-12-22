@@ -11,6 +11,7 @@ Key ideas:
 
 import argparse
 import asyncio
+import concurrent.futures
 import ipaddress
 import json
 import os
@@ -107,6 +108,7 @@ class Config:
     cpu_net: bool = True  # enable cpu/net sampling in status
     pretty_status: bool = True  # rich-based live status when available
     auth_backend: str = "ssh2"  # ssh2 (libssh2) or asyncssh
+    auth_pool_size: int = 0  # thread pool for ssh2 auth; 0 means auto=max_workers
 
 
 @dataclass
@@ -1294,6 +1296,12 @@ async def run(cfg: Config) -> None:
         "last_progress": time.monotonic(),
     }
 
+    auth_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+    if cfg.auth_backend == "ssh2":
+        auth_pool = max(1, cfg.auth_pool_size or cfg.max_workers)
+        auth_executor = concurrent.futures.ThreadPoolExecutor(max_workers=auth_pool)
+        asyncio.get_running_loop().set_default_executor(auth_executor)
+
     workers = [
         asyncio.create_task(
             worker(
@@ -1341,6 +1349,8 @@ async def run(cfg: Config) -> None:
             if completed:
                 cfg.target_state.update(cfg.target_updates)
             save_target_state(cfg.target_state_path, cfg.target_state)
+        if auth_executor:
+            auth_executor.shutdown(wait=False)
 
 
 # -----------------------------------------------------------------------------
@@ -1400,6 +1410,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["ssh2", "asyncssh"],
         default="ssh2",
         help="authentication backend (ssh2/libssh2 is faster; asyncssh available as fallback)",
+    )
+    p.add_argument(
+        "--auth-pool",
+        type=int,
+        default=0,
+        help="thread pool size for ssh2 backend (0 = auto match max-workers)",
     )
     # Note: a short sanity command runs after auth to ensure the session can execute commands; failures are treated as auth failures.
     return p
@@ -1494,6 +1510,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         print("[info] ssh2-python not available, falling back to asyncssh backend", flush=True)
         auth_backend = "asyncssh"
 
+    auth_pool_size = args.auth_pool if args.auth_pool and args.auth_pool > 0 else args.max_workers
+
     targets, new_target_state, target_updates = collect_targets(
         args,
         target_state=target_state,
@@ -1536,6 +1554,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         cpu_net=not args.no_cpu_net,
         pretty_status=not args.no_pretty_status,
         auth_backend=auth_backend,
+        auth_pool_size=auth_pool_size,
     )
 
     try:
