@@ -413,9 +413,13 @@ def ssh2_authenticate(item: WorkItem, cfg: Config) -> AuthResult:
                 sock.close()
 
 
-async def auth_with_ssh2(item: WorkItem, cfg: Config) -> AuthResult:
+async def auth_with_ssh2(
+    item: WorkItem,
+    cfg: Config,
+    executor: Optional[concurrent.futures.Executor],
+) -> AuthResult:
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, ssh2_authenticate, item, cfg)
+    return await loop.run_in_executor(executor, ssh2_authenticate, item, cfg)
 
 
 async def auth_with_asyncssh(item: WorkItem, cfg: Config, host_state: HostState) -> AuthResult:
@@ -736,6 +740,7 @@ async def attempt_login(
     state_lock: asyncio.Lock,
     gather_sem: asyncio.Semaphore,
     post_queue: "asyncio.Queue[dict]",
+    auth_executor: Optional[concurrent.futures.Executor],
 ) -> None:
     if global_stop.is_set() or host_state.stop.is_set():
         return
@@ -745,7 +750,7 @@ async def attempt_login(
         backend = "asyncssh"
 
     if backend == "ssh2":
-        auth_result = await auth_with_ssh2(item, cfg)
+        auth_result = await auth_with_ssh2(item, cfg, auth_executor)
     else:
         auth_result = await auth_with_asyncssh(item, cfg, host_state)
 
@@ -845,6 +850,7 @@ async def worker(
     state_lock: asyncio.Lock,
     gather_sem: asyncio.Semaphore,
     post_queue: "asyncio.Queue[dict]",
+    auth_executor: Optional[concurrent.futures.Executor],
 ) -> None:
     while True:
         item = await queue.get()
@@ -876,6 +882,7 @@ async def worker(
                         state_lock,
                         gather_sem,
                         post_queue,
+                        auth_executor,
                     ),
                     timeout=cfg.attempt_timeout,
                 )
@@ -892,6 +899,7 @@ async def worker(
                     state_lock,
                     gather_sem,
                     post_queue,
+                    auth_executor,
                 )
         except asyncio.TimeoutError:
             async with stats_lock:
@@ -1300,7 +1308,6 @@ async def run(cfg: Config) -> None:
     if cfg.auth_backend == "ssh2":
         auth_pool = max(1, cfg.auth_pool_size or cfg.max_workers)
         auth_executor = concurrent.futures.ThreadPoolExecutor(max_workers=auth_pool)
-        asyncio.get_running_loop().set_default_executor(auth_executor)
 
     workers = [
         asyncio.create_task(
@@ -1316,6 +1323,7 @@ async def run(cfg: Config) -> None:
                 state_lock,
                 gather_sem,
                 post_queue,
+                auth_executor,
             )
         )
         for _ in range(cfg.max_workers)
